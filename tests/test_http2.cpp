@@ -1887,9 +1887,11 @@ TEST_CASE("nghttp2-inspired client validation: server WINDOW_UPDATE short payloa
 }
 
 TEST_CASE("nghttp2-inspired client validation: server SETTINGS_ENABLE_PUSH is rejected") {
+  // RFC 7540 §6.5.2: server MUST NOT set ENABLE_PUSH to anything other
+  // than 0. Value 0 is valid; value 2+ is a protocol error.
   std::string frames;
   std::array<settings_entry, 1> settings{
-      settings_entry{settings_param::enable_push, 0},
+      settings_entry{settings_param::enable_push, 2},
   };
   frames += make_settings_frame(settings);
   frames += build_header_frame({{":status", "200"}},
@@ -2723,7 +2725,7 @@ TEST_CASE("GOAWAY with short payload triggers GOAWAY") {
   client.close();
 }
 
-TEST_CASE("request HEADERS priority self-dependency triggers GOAWAY") {
+TEST_CASE("request HEADERS priority self-dependency triggers RST_STREAM") {
   server_runner srv;
   srv.launch([](h2_request&, h2_response& resp)
                  -> async_simple::coro::Lazy<void> {
@@ -2746,7 +2748,8 @@ TEST_CASE("request HEADERS priority self-dependency triggers GOAWAY") {
       1, flags::END_HEADERS | flags::END_STREAM | flags::PRIORITY, 1);
   asio::write(client, asio::buffer(frames));
 
-  CHECK(read_until_frame_type(client, frame_type::goaway));
+  // RFC 7540 §5.3.1: self-dependency is a stream error, not connection error.
+  CHECK(read_until_frame_type(client, frame_type::rst_stream));
   client.close();
 }
 
@@ -2870,7 +2873,10 @@ TEST_CASE("SETTINGS invalid max_frame_size triggers GOAWAY") {
   client.close();
 }
 
-TEST_CASE("DATA without END_STREAM yields WINDOW_UPDATE frames") {
+TEST_CASE("DATA without END_STREAM yields batched WINDOW_UPDATE frames") {
+  // WINDOW_UPDATE is now batched: the server accumulates consumed bytes and
+  // only sends WINDOW_UPDATE when at least half of the initial window (65535/2)
+  // has been consumed.  Send enough DATA to cross the threshold.
   server_runner srv;
   srv.launch([](h2_request&, h2_response& resp)
                  -> async_simple::coro::Lazy<void> {
@@ -2884,17 +2890,42 @@ TEST_CASE("DATA without END_STREAM yields WINDOW_UPDATE frames") {
   connect_direct(client, port);
 
   std::string frames = build_post_headers("/upload", 1, false);
-  std::string body_data = "hello";
-  auto body_span = std::span<const uint8_t>(
-      reinterpret_cast<const uint8_t*>(body_data.data()), body_data.size());
-  frames += make_frame(frame_type::data, 0, 1, body_span);
   asio::write(client, asio::buffer(frames));
+
+  // Wait for server SETTINGS and ACK them.
+  std::array<uint8_t, 9> hdr_buf;
+  std::vector<uint8_t> payload;
+  for (int i = 0; i < 10; ++i) {
+    std::error_code ec;
+    asio::read(client, asio::buffer(hdr_buf), ec);
+    if (ec) break;
+    auto hdr = parse_frame_header(hdr_buf);
+    payload.resize(hdr.length);
+    if (hdr.length > 0) asio::read(client, asio::buffer(payload), ec);
+    if (ec) break;
+    if (hdr.type == frame_type::settings && !(hdr.flags & flags::ACK)) {
+      asio::write(client, asio::buffer(make_settings_frame({}, true)));
+      break;
+    }
+  }
+
+  // Send multiple DATA frames totalling > half the initial window (32768+)
+  // to trigger batched WINDOW_UPDATE. MAX_FRAME_SIZE is 16384.
+  constexpr size_t CHUNK = 16384;
+  constexpr int NUM_CHUNKS = 3;  // 3 * 16384 = 49152 > 32767 threshold
+  std::string chunk_data(CHUNK, 'X');
+  auto chunk_span = std::span<const uint8_t>(
+      reinterpret_cast<const uint8_t*>(chunk_data.data()), CHUNK);
+  for (int i = 0; i < NUM_CHUNKS; ++i) {
+    auto data_frame = make_frame(frame_type::data, 0, 1, chunk_span);
+    std::error_code ec;
+    asio::write(client, asio::buffer(data_frame), ec);
+    if (ec) break;
+  }
 
   bool got_conn_window_update = false;
   bool got_stream_window_update = false;
-  std::array<uint8_t, 9> hdr_buf;
-  std::vector<uint8_t> payload;
-  for (int i = 0; i < 20 &&
+  for (int i = 0; i < 30 &&
                   !(got_conn_window_update && got_stream_window_update); ++i) {
     std::error_code ec;
     asio::read(client, asio::buffer(hdr_buf), ec);
@@ -2904,19 +2935,14 @@ TEST_CASE("DATA without END_STREAM yields WINDOW_UPDATE frames") {
     if (hdr.length > 0) asio::read(client, asio::buffer(payload), ec);
     if (ec) break;
 
-    if (hdr.type == frame_type::settings && !(hdr.flags & flags::ACK)) {
-      asio::write(client, asio::buffer(make_settings_frame({}, true)));
-      continue;
-    }
-
     if (hdr.type == frame_type::window_update && hdr.length == 4) {
       uint32_t increment = ((uint32_t(payload[0]) & 0x7f) << 24) |
                            (uint32_t(payload[1]) << 16) |
                            (uint32_t(payload[2]) << 8) |
                            uint32_t(payload[3]);
-      if (increment == body_data.size() && hdr.stream_id == 0)
+      if (hdr.stream_id == 0 && increment > 0)
         got_conn_window_update = true;
-      if (increment == body_data.size() && hdr.stream_id == 1)
+      if (hdr.stream_id == 1 && increment > 0)
         got_stream_window_update = true;
     }
   }

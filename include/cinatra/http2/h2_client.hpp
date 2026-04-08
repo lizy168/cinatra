@@ -75,6 +75,7 @@ class coro_http2_client {
       next_stream_id_ = 1;
       connection_send_window_ = static_cast<int32_t>(DEFAULT_WINDOW_SIZE);
       connection_recv_window_ = static_cast<int32_t>(DEFAULT_WINDOW_SIZE);
+      connection_recv_pending_ = 0;
       peer_initial_window_size_ = DEFAULT_WINDOW_SIZE;
       peer_max_frame_size_ = MAX_FRAME_SIZE;
       peer_max_concurrent_streams_ = std::numeric_limits<uint32_t>::max();
@@ -232,6 +233,7 @@ class coro_http2_client {
     std::vector<uint8_t>                hdr_block_buf;
     int32_t                             recv_window =
         static_cast<int32_t>(DEFAULT_WINDOW_SIZE);
+    uint32_t                            recv_pending = 0;
     int32_t                             send_window =
         static_cast<int32_t>(DEFAULT_WINDOW_SIZE);
     std::atomic<bool>                   done_signaled = false;
@@ -487,8 +489,12 @@ class coro_http2_client {
           encoder_.set_max_dynamic_table_size(setting.value);
           break;
         case settings_param::enable_push:
-          fail_all_streams(std::make_error_code(std::errc::protocol_error));
-          co_return false;
+          // RFC 7540 §6.5.2: server MUST NOT set ENABLE_PUSH to anything
+          // other than 0. Receipt of any other value from the server is
+          // a connection error.
+          if (setting.value != 0) co_return fail_connection(
+              std::make_error_code(std::errc::protocol_error));
+          break;
         case settings_param::max_concurrent_streams:
           peer_concurrent = setting.value;
           notify_stream_limit = true;
@@ -551,8 +557,19 @@ class coro_http2_client {
                          (uint32_t(payload[1]) << 16) |
                          (uint32_t(payload[2]) << 8) |
                          uint32_t(payload[3]);
-    if (increment == 0) co_return fail_connection(
-        std::make_error_code(std::errc::protocol_error));
+    if (increment == 0) {
+      // RFC 7540 §6.9: increment 0 is connection error when stream_id == 0,
+      // stream error (RST_STREAM) otherwise.
+      if (hdr.stream_id == 0) co_return fail_connection(
+          std::make_error_code(std::errc::protocol_error));
+      auto rst_st = find_stream(hdr.stream_id);
+      if (rst_st) {
+        rst_st->resp.net_err = std::make_error_code(std::errc::protocol_error);
+        finish_stream(rst_st);
+      }
+      co_return co_await write_frame(
+          make_rst_stream(hdr.stream_id, h2_error_code::protocol_error));
+    }
 
     std::shared_ptr<stream_state> st;
     if (hdr.stream_id != 0) {
@@ -757,21 +774,39 @@ class coro_http2_client {
       }
     }
 
+    st->resp.body.append(
+        reinterpret_cast<const char*>(data.payload.data()), data.payload.size());
+
+    // Flow control: decrement, accumulate pending, flush WINDOW_UPDATE when
+    // half of the initial window has been consumed. Zero-length DATA does
+    // not trigger WINDOW_UPDATE (increment 0 is a protocol error).
+    bool stream_done = (hdr.flags & flags::END_STREAM) != 0;
     if (hdr.length > 0) {
       connection_recv_window_ -= static_cast<int32_t>(hdr.length);
       st->recv_window -= static_cast<int32_t>(hdr.length);
-    }
-    st->resp.body.append(
-        reinterpret_cast<const char*>(data.payload.data()), data.payload.size());
-    if (hdr.length > 0) {
-      connection_recv_window_ += static_cast<int32_t>(hdr.length);
-      st->recv_window += static_cast<int32_t>(hdr.length);
-    }
+      connection_recv_pending_ += hdr.length;
 
-    if (hdr.length > 0) {
-      if (!co_await write_frame(make_window_update(0, hdr.length)) ||
-          !co_await write_frame(make_window_update(hdr.stream_id, hdr.length))) {
-        co_return false;
+      uint32_t threshold = DEFAULT_WINDOW_SIZE / 2;
+      if (connection_recv_pending_ >= threshold) {
+        uint32_t inc = connection_recv_pending_;
+        connection_recv_pending_ = 0;
+        connection_recv_window_ += static_cast<int32_t>(inc);
+        if (!co_await write_frame(make_window_update(0, inc)))
+          co_return false;
+      }
+      if (stream_done) {
+        // Peer won't send more DATA for this stream; no WINDOW_UPDATE needed.
+        st->recv_window += static_cast<int32_t>(hdr.length);
+      }
+      else {
+        st->recv_pending += hdr.length;
+        if (st->recv_pending >= threshold) {
+          uint32_t inc = st->recv_pending;
+          st->recv_pending = 0;
+          st->recv_window += static_cast<int32_t>(inc);
+          if (!co_await write_frame(make_window_update(hdr.stream_id, inc)))
+            co_return false;
+        }
       }
     }
 
@@ -1107,6 +1142,7 @@ class coro_http2_client {
       static_cast<int32_t>(DEFAULT_WINDOW_SIZE);
   int32_t                                       connection_recv_window_ =
       static_cast<int32_t>(DEFAULT_WINDOW_SIZE);
+  uint32_t                                      connection_recv_pending_ = 0;
   std::atomic<uint32_t>                         active_stream_count_ = 0;
   std::atomic<bool>                             connection_closed_ = false;
   bool                                          connected_ = false;

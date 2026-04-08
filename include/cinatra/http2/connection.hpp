@@ -263,6 +263,7 @@ class coro_http2_connection
         socket_.shutdown(asio::ip::tcp::socket::shutdown_send, ignored);
         co_return;
       }
+      cleanup_done_streams();
     }
   }
 
@@ -287,9 +288,11 @@ class coro_http2_connection
     stream_lifecycle     state       = stream_lifecycle::idle;
     int32_t              recv_window =
         static_cast<int32_t>(DEFAULT_WINDOW_SIZE);
+    uint32_t             recv_pending = 0;  // bytes consumed but not yet ACKed
     int32_t              send_window =
         static_cast<int32_t>(DEFAULT_WINDOW_SIZE);
     bool                 dispatch_started = false;
+    bool                 dispatch_done   = false;  // set by dispatch_stream
     std::optional<uint64_t> content_length;
   };
 
@@ -307,6 +310,7 @@ class coro_http2_connection
 
   struct payload_view_result {
     bool ok = false;
+    bool stream_error = false;  // if true, caller should RST_STREAM not GOAWAY
     std::span<const uint8_t> payload{};
     h2_error_code error_code = h2_error_code::protocol_error;
   };
@@ -566,6 +570,11 @@ class coro_http2_connection
 
     auto frag = strip_padding_priority(hdr, payload);
     if (!frag.ok) {
+      if (frag.stream_error) {
+        abort_stream(hdr.stream_id);
+        co_return co_await write_frame(
+            make_rst_stream(hdr.stream_id, frag.error_code));
+      }
       co_await write_frame(make_goaway(last_stream_id_, frag.error_code));
       co_return false;
     }
@@ -636,9 +645,11 @@ class coro_http2_connection
       co_return false;
     }
     if (spec->stream_dependency == hdr.stream_id) {
-      co_await write_frame(
-          make_goaway(last_stream_id_, h2_error_code::protocol_error));
-      co_return false;
+      // RFC 7540 §5.3.1: self-dependency is a stream error of type
+      // PROTOCOL_ERROR, not a connection error.
+      abort_stream(hdr.stream_id);
+      co_return co_await write_frame(
+          make_rst_stream(hdr.stream_id, h2_error_code::protocol_error));
     }
     co_return true;
   }
@@ -716,10 +727,10 @@ class coro_http2_connection
           make_goaway(last_stream_id_, h2_error_code::frame_size_error));
       co_return false;
     }
-    // Clean up stream; do not dispatch.
+    // Clean up stream; do not dispatch. (Note: a RST_STREAM arriving while
+    // pending_continuation_stream_ != 0 is already rejected by handle_frame,
+    // so no continuation reset is needed here.)
     abort_stream(hdr.stream_id);
-    if (pending_continuation_stream_ == hdr.stream_id)
-      pending_continuation_stream_ = 0;
     co_return true;
   }
 
@@ -781,10 +792,8 @@ class coro_http2_connection
       co_return true;
     st->req.body.append(
         reinterpret_cast<const char*>(data.payload.data()), data.payload.size());
-    restore_flow_control(hdr.stream_id, hdr.length, true);
-    if (!co_await write_frame(make_window_update(0, hdr.length)))
-      co_return false;
-    if (!co_await write_frame(make_window_update(hdr.stream_id, hdr.length)))
+    bool stream_done = (hdr.flags & flags::END_STREAM) != 0;
+    if (!co_await refill_flow_control(hdr.stream_id, *st, hdr.length, stream_done))
       co_return false;
     if (hdr.flags & flags::END_STREAM) {
       if (st->content_length.has_value() &&
@@ -837,9 +846,14 @@ class coro_http2_connection
   }
 
   async_simple::coro::Lazy<void> dispatch_stream(uint32_t stream_id) {
-    auto it = streams_.find(stream_id);
-    if (it == streams_.end()) co_return;
-    auto st = it->second;
+    // Look up stream – we hold a shared_ptr, so it stays alive even if
+    // the read loop clears the map entry later.
+    std::shared_ptr<stream_state> st;
+    {
+      auto it = streams_.find(stream_id);
+      if (it == streams_.end()) co_return;
+      st = it->second;
+    }
 
     h2_response resp;
     try {
@@ -848,7 +862,11 @@ class coro_http2_connection
       resp.set_status_and_body(500, "Internal Server Error");
     }
     bool ok = co_await send_response(stream_id, *st, resp);
-    streams_.erase(stream_id);  // stream fully closed
+    // Mark for deferred cleanup by the read loop (avoids data race on
+    // streams_ map).  The read loop calls cleanup_done_streams() after
+    // every frame.
+    st->dispatch_done = true;
+    pending_cleanup_ = true;
     finish_graceful_shutdown();
     if (!ok && connection_closed_.load()) {
       std::error_code ignored;
@@ -958,7 +976,9 @@ class coro_http2_connection
         return {.ok = false, .error_code = h2_error_code::frame_size_error};
       }
       if (spec->stream_dependency == hdr.stream_id) {
-        return {.ok = false, .error_code = h2_error_code::protocol_error};
+        return {.ok = false,
+                .stream_error = true,
+                .error_code = h2_error_code::protocol_error};
       }
       payload = payload.subspan(5);
     }
@@ -1113,13 +1133,40 @@ class coro_http2_connection
     co_return flow_control_result::ok;
   }
 
-  void restore_flow_control(uint32_t stream_id, uint32_t amount,
-                            bool restore_stream_window) {
-    connection_recv_window_ += static_cast<int32_t>(amount);
-    if (restore_stream_window) {
-      if (auto it = streams_.find(stream_id); it != streams_.end())
-        it->second->recv_window += static_cast<int32_t>(amount);
+  // Accumulate consumed bytes and send WINDOW_UPDATE when a threshold is
+  // crossed (half of the initial window). Zero-length DATA produces no
+  // WINDOW_UPDATE (increment 0 is a protocol error per RFC 7540 §6.9).
+  // When stream_done is true (END_STREAM), no stream-level WINDOW_UPDATE
+  // is sent since the peer will send no more DATA for this stream.
+  async_simple::coro::Lazy<bool> refill_flow_control(
+      uint32_t stream_id, stream_state& st, uint32_t amount,
+      bool stream_done) {
+    if (amount == 0) co_return true;
+    connection_recv_pending_ += amount;
+
+    uint32_t threshold = local_initial_window_size_ / 2;
+    if (threshold == 0) threshold = 1;
+    if (connection_recv_pending_ >= threshold) {
+      uint32_t inc = connection_recv_pending_;
+      connection_recv_pending_ = 0;
+      connection_recv_window_ += static_cast<int32_t>(inc);
+      if (!co_await write_frame(make_window_update(0, inc)))
+        co_return false;
     }
+    if (stream_done) {
+      // Peer won't send more on this stream; just absorb locally.
+      st.recv_window += static_cast<int32_t>(amount);
+      co_return true;
+    }
+    st.recv_pending += amount;
+    if (st.recv_pending >= threshold) {
+      uint32_t inc = st.recv_pending;
+      st.recv_pending = 0;
+      st.recv_window += static_cast<int32_t>(inc);
+      if (!co_await write_frame(make_window_update(stream_id, inc)))
+        co_return false;
+    }
+    co_return true;
   }
 
   void notify_quit() {
@@ -1131,6 +1178,20 @@ class coro_http2_connection
     send_window_cv_.notifyAll();
   }
 
+  // Called from the read loop to erase streams that dispatch_stream has
+  // finished processing.  This keeps streams_ modifications on the read
+  // coroutine, eliminating data races.
+  void cleanup_done_streams() {
+    if (!pending_cleanup_) return;
+    pending_cleanup_ = false;
+    for (auto it = streams_.begin(); it != streams_.end();) {
+      if (it->second->dispatch_done)
+        it = streams_.erase(it);
+      else
+        ++it;
+    }
+  }
+
   void abort_stream(uint32_t stream_id) {
     if (auto it = streams_.find(stream_id); it != streams_.end()) {
       it->second->state = stream_lifecycle::closed;
@@ -1139,8 +1200,15 @@ class coro_http2_connection
     }
   }
 
+  bool has_active_streams() const {
+    for (auto& [id, st] : streams_) {
+      if (!st->dispatch_done) return true;
+    }
+    return false;
+  }
+
   void finish_graceful_shutdown() {
-    if (!going_away_ || connection_closed_.load() || !streams_.empty()) return;
+    if (!going_away_ || connection_closed_.load() || has_active_streams()) return;
     if (peer_sent_goaway_) {
       force_close();
       return;
@@ -1192,10 +1260,12 @@ class coro_http2_connection
       static_cast<int32_t>(DEFAULT_WINDOW_SIZE);
   int32_t                                    connection_recv_window_ =
       static_cast<int32_t>(DEFAULT_WINDOW_SIZE);
+  uint32_t                                   connection_recv_pending_ = 0;
   std::atomic<bool>                          connection_closed_ = false;
   bool                                       going_away_ = false;
   bool                                       peer_sent_goaway_ = false;
   bool                                       enable_connect_protocol_ = false;
+  bool                                       pending_cleanup_ = false;
   std::optional<h2_error_code>               pending_connection_error_;
   std::vector<uint8_t>                       payload_buf_;
 };

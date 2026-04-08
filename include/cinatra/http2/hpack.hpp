@@ -119,6 +119,20 @@ class dynamic_table {
 
   size_t size() const { return entries_.size(); }
 
+  // Search for a matching entry. Returns {1-based local index, value_matches}.
+  // Returns {0, false} if no name match found.
+  std::pair<size_t, bool> find(std::string_view name,
+                                std::string_view value) const {
+    size_t name_only = 0;
+    for (size_t i = 0; i < entries_.size(); ++i) {
+      if (entries_[i].name == name) {
+        if (entries_[i].value == value) return {i + 1, true};
+        if (name_only == 0) name_only = i + 1;
+      }
+    }
+    return {name_only, false};
+  }
+
   void set_max_size(size_t s) {
     max_size_ = s;
     while (!entries_.empty() && current_size_ > max_size_) {
@@ -301,7 +315,7 @@ class hpack_encoder {
   }
 
   // Encode headers → header block bytes.
-  // Strategy: indexed if found in static table (name+value match),
+  // Strategy: indexed if found in static or dynamic table (name+value match),
   //           literal with incremental indexing otherwise.
   std::vector<uint8_t> encode(
       std::span<const header_field> headers) {
@@ -311,13 +325,13 @@ class hpack_encoder {
       pending_table_size_update_ = false;
     }
     for (auto& hf : headers) {
-      auto [si, full_match] = static_lookup(hf.name, hf.value);
+      auto [idx, full_match] = table_lookup(hf.name, hf.value);
       if (full_match) {
         // Indexed header field (RFC 7541 §6.1): 0b1xxxxxxx
-        encode_integer(out, si, 7, 0x80);
-      } else if (si != 0) {
+        encode_integer(out, idx, 7, 0x80);
+      } else if (idx != 0) {
         // Literal with incremental indexing, indexed name (§6.2.1): 0b01xxxxxx
-        encode_integer(out, si, 6, 0x40);
+        encode_integer(out, idx, 6, 0x40);
         encode_string(out, hf.value);
         dyn_.add(hf.name, hf.value);
       } else {
@@ -332,16 +346,26 @@ class hpack_encoder {
   }
 
  private:
-  // Returns {static_index, value_also_matches}.
-  std::pair<uint32_t, bool> static_lookup(std::string_view name,
-                                           std::string_view value) const {
+  // Returns {index, value_also_matches}. Searches both static and dynamic
+  // tables (RFC 7541 §2.3.3). Prefers a full match over a name-only match.
+  std::pair<uint32_t, bool> table_lookup(std::string_view name,
+                                          std::string_view value) const {
     uint32_t name_only_idx = 0;
+    // Static table: indices 1..61
     for (uint32_t i = 1; i <= STATIC_TABLE_SIZE; ++i) {
       auto& e = HPACK_STATIC_TABLE[i];
       if (e.name == name) {
         if (e.value == value) return {i, true};
         if (name_only_idx == 0) name_only_idx = i;
       }
+    }
+    // Dynamic table: indices STATIC_TABLE_SIZE+1 ..
+    auto [dyn_local, dyn_full] = dyn_.find(name, value);
+    if (dyn_full) {
+      return {uint32_t(STATIC_TABLE_SIZE + dyn_local), true};
+    }
+    if (dyn_local != 0 && name_only_idx == 0) {
+      name_only_idx = uint32_t(STATIC_TABLE_SIZE + dyn_local);
     }
     return {name_only_idx, false};
   }
