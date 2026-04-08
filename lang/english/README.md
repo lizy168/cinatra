@@ -22,9 +22,9 @@ Cinatra is a high-performance, easy-to-use http framework developed in Modern C+
 4. Efficient
 5. Support for AOP (aspect-oriented programming)
 
-Cinatra currently supports HTTP 1.1/1.0, TLS/SSL and [WebSocket](https://www.wikiwand.com/en/WebSocket) protocols. You can use it to easily develop an HTTP server, such as a common database access server, a file upload/download server, real-time message push server, as well as a [MQTT](https://www.wikiwand.com/en/MQTT) server.
+Cinatra currently supports HTTP 1.1/1.0, HTTP/2, TLS/SSL and [WebSocket](https://www.wikiwand.com/en/WebSocket) protocols. You can use it to easily develop an HTTP server, such as a common database access server, a file upload/download server, real-time message push server, as well as a [MQTT](https://www.wikiwand.com/en/MQTT) server.
 
-Cinatra also provides a C++ 20 coroutine http(https) client, include such functions: get/post, upload(multipart), download(chunked and ranges), websocket, redirect, proxy etc.
+Cinatra also provides a C++ 20 coroutine http(https) client, include such functions: get/post, upload(multipart), download(chunked and ranges), websocket, redirect, proxy etc. The HTTP/2 APIs live under the `cinatra::http2` namespace.
 
 ## Usage
 
@@ -74,6 +74,47 @@ cmake -DENABLE_SIMD=AARCH64 .. # enable neon instruction set in aarch64
 		server.sync_start();
 		return 0;
 	}
+```
+
+### HTTP/2 quick example
+
+The minimal HTTP/2 server/client example is available in [example/http2_example.cpp](../../example/http2_example.cpp).
+
+Note: the current example uses cleartext TCP HTTP/2 framing and does not configure TLS/ALPN.
+
+```c++
+#include <asio/io_context.hpp>
+#include <async_simple/coro/SyncAwait.h>
+
+#include "cinatra/http2/h2_client.hpp"
+#include "cinatra/http2/h2_server.hpp"
+
+int main() {
+  asio::io_context ioc;
+  auto work = asio::make_work_guard(ioc);
+  coro_io::ExecutorWrapper<> exec(ioc.get_executor());
+  std::thread io_thread([&] { ioc.run(); });
+
+  cinatra::http2::coro_http2_server server(ioc, 0);
+  server.set_http_handler<cinatra::GET>(
+      "/hello",
+      [](cinatra::http2::h2_request&, cinatra::http2::h2_response& resp) {
+        resp.set_status_and_body(200, "hello http2");
+      });
+  auto port = server.start(exec);
+
+  cinatra::http2::coro_http2_client client(&exec);
+  async_simple::coro::syncAwait(
+      client.connect("127.0.0.1", std::to_string(port)));
+  auto resp = async_simple::coro::syncAwait(client.async_get("/hello"));
+  std::cout << resp.status_code << " " << resp.body << "\n";
+
+  client.close();
+  server.stop();
+  work.reset();
+  ioc.stop();
+  io_thread.join();
+}
 ```
 
 ### Example 2: Access to request header, query parameter, and response

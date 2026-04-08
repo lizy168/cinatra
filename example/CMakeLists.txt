@@ -13,6 +13,10 @@ endif()
 add_executable(${project_name} ${CINATRA_EXAMPLE})
 target_compile_definitions(${project_name} PRIVATE ASYNC_SIMPLE_HAS_NOT_AIO)
 
+add_executable(http2_example http2_example.cpp)
+target_compile_definitions(http2_example PRIVATE ASYNC_SIMPLE_HAS_NOT_AIO)
+target_link_libraries(http2_example PRIVATE Threads::Threads)
+
 if (BUILD_BENCHMARK)
 	add_executable(benchmark benchmark.cpp)
 	target_compile_definitions(benchmark PRIVATE ASYNC_SIMPLE_HAS_NOT_AIO)
