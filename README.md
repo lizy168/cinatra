@@ -37,7 +37,7 @@
 cinatra目前支持了http1.1/1.0, http/2, ssl和websocket, 你可以用它轻易地开发一个http服务器，比如常见的数据库访问服务器、文件上传下载服务器、实时消息推送服务器，你也可以基于cinatra开发一个mqtt服务器。
 cinatra是世界上性能最好的http服务器之一，性能测试详见[性能测试](#性能测试)
 
-除此之外，cinatra 还提供了一个基于C++20 协程的http(https) client，包括普通get/post请求、文件上传下载和web socket、redirect、proxy等功能。HTTP/2 相关API位于 `cinatra::http2` 命名空间下。
+除此之外，cinatra 还提供了一个基于C++20 协程的http(https) client，包括普通get/post请求、文件上传下载和web socket、redirect、proxy等功能。HTTP/2 client 相关API位于 `cinatra::http2` 命名空间下，服务端由 `cinatra::coro_http_server` 统一支持。
 
 ## 谁在用cinatra
 
@@ -97,16 +97,16 @@ cmake -DENABLE_SIMD=AARCH64 .. # arm环境下,启用neon指令集
 
 ## HTTP/2 快速示例
 
-当前 HTTP/2 API 位于 `cinatra::http2` 命名空间。下面的例子展示了一个最小的 HTTP/2 服务端和客户端，完整代码见 [example/http2_example.cpp](example/http2_example.cpp)。
+服务端通过 `cinatra::coro_http_server` 统一支持 HTTP/1.1 和 HTTP/2。下面的例子展示了一个最小的 HTTP/2 服务端和客户端，完整代码见 [example/http2_example.cpp](example/http2_example.cpp)。
 
-注意：当前示例使用明文 TCP 连接上的 HTTP/2 帧，不包含 TLS/ALPN 配置。
+注意：`coro_http_server` 的 HTTP/2 服务端只在开启 TLS 后通过 ALPN 启用；明文连接保持原 HTTP/1.1 行为。
 
 ```c++
 #include <asio/io_context.hpp>
 #include <async_simple/coro/SyncAwait.h>
 
+#include "cinatra/coro_http_server.hpp"
 #include "cinatra/http2/h2_client.hpp"
-#include "cinatra/http2/h2_server.hpp"
 
 int main() {
   asio::io_context ioc;
@@ -114,17 +114,21 @@ int main() {
   coro_io::ExecutorWrapper<> exec(ioc.get_executor());
   std::thread io_thread([&] { ioc.run(); });
 
-  cinatra::http2::coro_http2_server server(ioc, 0);
+  cinatra::coro_http_server server(ioc, 0);
+  server.set_http2_mode(cinatra::http2_mode::required);
+  server.init_ssl("include/cinatra/server.crt", "include/cinatra/server.key",
+                  "test");
   server.set_http_handler<cinatra::GET>(
       "/hello",
-      [](cinatra::http2::h2_request&, cinatra::http2::h2_response& resp) {
-        resp.set_status_and_body(200, "hello http2");
+      [](cinatra::coro_http_request&, cinatra::coro_http_response& resp) {
+        resp.set_status_and_content(cinatra::status_type::ok, "hello http2");
       });
-  auto port = server.start(exec);
+  server.async_start();
+  auto port = server.port();
 
   cinatra::http2::coro_http2_client client(&exec);
   async_simple::coro::syncAwait(
-      client.connect("127.0.0.1", std::to_string(port)));
+      client.connect("127.0.0.1", std::to_string(port), "https"));
   auto resp = async_simple::coro::syncAwait(client.async_get("/hello"));
   std::cout << resp.status_code << " " << resp.body << "\n";
 
@@ -629,6 +633,4 @@ qq群：545605838
 [https://github.com/qicosmos/cinatra](https://github.com/qicosmos/cinatra "cinatra")
 
 [https://gitcode.com/qicosmos/cinatra](https://gitcode.com/qicosmos/cinatra "cinatra")
-
-
 

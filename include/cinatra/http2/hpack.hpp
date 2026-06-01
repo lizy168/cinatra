@@ -2,16 +2,17 @@
 #include <array>
 #include <cstdint>
 #include <deque>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
 
-// HPACK – Header Compression for HTTP/2 (RFC 7541)
+// HPACK - Header Compression for HTTP/2 (RFC 7541)
 #include "hpack_huffman.hpp"
 
-// Phase 2: static table + dynamic table + Huffman string coding.
+// static table + dynamic table + Huffman string coding.
 namespace cinatra::http2 {
 
 struct header_field {
@@ -19,7 +20,19 @@ struct header_field {
   std::string value;
 };
 
-// ── Static table (RFC 7541 Appendix A) ──────────────────────────────────────
+inline bool header_list_size_within_limit(
+    std::span<const header_field> headers, uint32_t max_header_list_size) {
+  uint64_t total = 0;
+  for (auto& hf : headers) {
+    total += static_cast<uint64_t>(hf.name.size()) +
+             static_cast<uint64_t>(hf.value.size()) + 32;
+    if (total > max_header_list_size)
+      return false;
+  }
+  return true;
+}
+
+// --- Static table (RFC 7541 Appendix A) ---
 // Index starts at 1; index 0 is unused (placeholder).
 struct static_entry {
   std::string_view name;
@@ -27,7 +40,7 @@ struct static_entry {
 };
 
 inline constexpr std::array<static_entry, 62> HPACK_STATIC_TABLE = {{
-    {"", ""},                                          // 0 – unused
+    {"", ""},                                          // 0 - unused
     {":authority",                  ""},               // 1
     {":method",                     "GET"},            // 2
     {":method",                     "POST"},           // 3
@@ -93,7 +106,7 @@ inline constexpr std::array<static_entry, 62> HPACK_STATIC_TABLE = {{
 
 constexpr size_t STATIC_TABLE_SIZE = 61;  // indices 1..61
 
-// ── Dynamic table ────────────────────────────────────────────────────────────
+// --- Dynamic table ---
 
 class dynamic_table {
  public:
@@ -101,7 +114,7 @@ class dynamic_table {
 
   // Add entry at front (index 62 after static table)
   void add(std::string name, std::string value) {
-    size_t entry_size = name.size() + value.size() + 32;  // RFC 7541 §4.1
+    size_t entry_size = name.size() + value.size() + 32;  // RFC 7541 section 4.1
     // Evict oldest entries until there is room
     while (!entries_.empty() && current_size_ + entry_size > max_size_) {
       evict();
@@ -152,7 +165,7 @@ class dynamic_table {
   size_t current_size_ = 0;
 };
 
-// ── Integer coding (RFC 7541 §5.1) ──────────────────────────────────────────
+// --- Integer coding (RFC 7541 section 5.1) ---
 
 // Decode a variable-length integer with `prefix_bits` prefix bits.
 // Advances `buf` past the consumed bytes.
@@ -196,7 +209,7 @@ inline void encode_integer(std::vector<uint8_t>& out, uint32_t value,
   out.push_back(uint8_t(value));
 }
 
-// ── String coding (RFC 7541 §5.2) ───────────────────────────────────────────
+// --- String coding (RFC 7541 section 5.2) ---
 
 inline std::string decode_string(std::span<const uint8_t>& buf) {
   if (buf.empty()) throw std::runtime_error("hpack: truncated string");
@@ -225,7 +238,7 @@ inline void encode_string(std::vector<uint8_t>& out, std::string_view s) {
              reinterpret_cast<const uint8_t*>(s.data()) + s.size());
 }
 
-// ── HPACK decoder ────────────────────────────────────────────────────────────
+// --- HPACK decoder ---
 
 class hpack_decoder {
  public:
@@ -238,7 +251,7 @@ class hpack_decoder {
     dyn_.set_max_size(max_dynamic_size);
   }
 
-  // Decode a complete header block fragment → list of header fields.
+  // Decode a complete header block fragment -> list of header fields.
   std::vector<header_field> decode(std::span<const uint8_t> block) {
     std::vector<header_field> headers;
     bool at_beginning = true;
@@ -246,14 +259,14 @@ class hpack_decoder {
       uint8_t first = block[0];
 
       if (first & 0x80) {
-        // ── Indexed header field (RFC 7541 §6.1) ─────────────────────────
+        // --- Indexed header field (RFC 7541 section 6.1) ---
         // 0b1xxxxxxx
         at_beginning = false;
         uint32_t idx = decode_integer(block, 7);
         headers.push_back(lookup(idx));
 
       } else if (first & 0x40) {
-        // ── Literal with incremental indexing (RFC 7541 §6.2.1) ──────────
+        // --- Literal with incremental indexing (RFC 7541 section 6.2.1) ---
         // 0b01xxxxxx
         at_beginning = false;
         uint32_t idx = decode_integer(block, 6);
@@ -264,7 +277,7 @@ class hpack_decoder {
         headers.push_back({std::move(name), std::move(value)});
 
       } else if ((first & 0xe0) == 0x20) {
-        // ── Dynamic table size update (RFC 7541 §6.3) ────────────────────
+        // --- Dynamic table size update (RFC 7541 section 6.3) ---
         // 0b001xxxxx
         uint32_t new_size = decode_integer(block, 5);
         if (!at_beginning)
@@ -274,7 +287,7 @@ class hpack_decoder {
         dyn_.set_max_size(new_size);
 
       } else {
-        // ── Literal without indexing / never indexed (RFC 7541 §6.2.2/6.2.3)
+        // --- Literal without indexing / never indexed (RFC 7541 section 6.2.2/6.2.3)
         // 0b0000xxxx / 0b0001xxxx
         at_beginning = false;
         uint32_t idx = decode_integer(block, 4);
@@ -304,7 +317,7 @@ class hpack_decoder {
   size_t max_dynamic_size_ = 4096;
 };
 
-// ── HPACK encoder ────────────────────────────────────────────────────────────
+// --- HPACK encoder ---
 
 class hpack_encoder {
  public:
@@ -314,7 +327,7 @@ class hpack_encoder {
     dyn_.set_max_size(max_dynamic_size);
   }
 
-  // Encode headers → header block bytes.
+  // Encode headers -> header block bytes.
   // Strategy: indexed if found in static or dynamic table (name+value match),
   //           literal with incremental indexing otherwise.
   std::vector<uint8_t> encode(
@@ -327,15 +340,15 @@ class hpack_encoder {
     for (auto& hf : headers) {
       auto [idx, full_match] = table_lookup(hf.name, hf.value);
       if (full_match) {
-        // Indexed header field (RFC 7541 §6.1): 0b1xxxxxxx
+        // Indexed header field (RFC 7541 section 6.1): 0b1xxxxxxx
         encode_integer(out, idx, 7, 0x80);
       } else if (idx != 0) {
-        // Literal with incremental indexing, indexed name (§6.2.1): 0b01xxxxxx
+        // Literal with incremental indexing, indexed name (section 6.2.1): 0b01xxxxxx
         encode_integer(out, idx, 6, 0x40);
         encode_string(out, hf.value);
         dyn_.add(hf.name, hf.value);
       } else {
-        // Literal with incremental indexing, new name (§6.2.1): 0b01000000
+        // Literal with incremental indexing, new name (section 6.2.1): 0b01000000
         out.push_back(0x40);
         encode_string(out, hf.name);
         encode_string(out, hf.value);
@@ -347,7 +360,7 @@ class hpack_encoder {
 
  private:
   // Returns {index, value_also_matches}. Searches both static and dynamic
-  // tables (RFC 7541 §2.3.3). Prefers a full match over a name-only match.
+  // tables (RFC 7541 section 2.3.3). Prefers a full match over a name-only match.
   std::pair<uint32_t, bool> table_lookup(std::string_view name,
                                           std::string_view value) const {
     uint32_t name_only_idx = 0;

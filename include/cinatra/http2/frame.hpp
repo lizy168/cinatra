@@ -11,7 +11,7 @@
 // HTTP/2 binary framing layer (RFC 7540)
 namespace cinatra::http2 {
 
-// ── Frame types (RFC 7540 §6) ────────────────────────────────────────────────
+// --- Frame types (RFC 7540 section 6) ---
 enum class frame_type : uint8_t {
   data          = 0x0,
   headers       = 0x1,
@@ -25,7 +25,7 @@ enum class frame_type : uint8_t {
   continuation  = 0x9,
 };
 
-// ── Flag bits (meaning varies by frame type) ─────────────────────────────────
+// --- Flag bits (meaning varies by frame type) ---
 namespace flags {
 constexpr uint8_t END_STREAM  = 0x1;
 constexpr uint8_t ACK         = 0x1;
@@ -34,7 +34,7 @@ constexpr uint8_t PADDED      = 0x8;
 constexpr uint8_t PRIORITY    = 0x20;
 }  // namespace flags
 
-// ── Error codes (RFC 7540 §7) ────────────────────────────────────────────────
+// --- Error codes (RFC 7540 section 7) ---
 enum class h2_error_code : uint32_t {
   no_error            = 0x0,
   protocol_error      = 0x1,
@@ -52,7 +52,7 @@ enum class h2_error_code : uint32_t {
   http_1_1_required   = 0xd,
 };
 
-// ── Settings parameters (RFC 7540 §6.5.2) ───────────────────────────────────
+// --- Settings parameters (RFC 7540 section 6.5.2) ---
 enum class settings_param : uint16_t {
   header_table_size      = 0x1,
   enable_push            = 0x2,
@@ -74,7 +74,7 @@ struct priority_spec {
   uint8_t  weight = 0;
 };
 
-// ── Fixed 9-byte frame header (RFC 7540 §4.1) ───────────────────────────────
+// --- Fixed 9-byte frame header (RFC 7540 section 4.1) ---
 struct frame_header {
   uint32_t   length;     // 24-bit payload length
   frame_type type;
@@ -82,7 +82,7 @@ struct frame_header {
   uint32_t   stream_id;  // 31-bit; R flag (bit 31) ignored
 };
 
-// Parse 9 raw bytes → frame_header
+// Parse 9 raw bytes -> frame_header
 inline frame_header parse_frame_header(
     std::span<const uint8_t, 9> buf) noexcept {
   frame_header h;
@@ -96,7 +96,7 @@ inline frame_header parse_frame_header(
   return h;
 }
 
-// Serialize frame_header → 9 bytes
+// Serialize frame_header -> 9 bytes
 inline std::array<uint8_t, 9> serialize_frame_header(
     const frame_header& h) noexcept {
   std::array<uint8_t, 9> buf{};
@@ -112,7 +112,7 @@ inline std::array<uint8_t, 9> serialize_frame_header(
   return buf;
 }
 
-// ── Frame builders ───────────────────────────────────────────────────────────
+// --- Frame builders ---
 
 // Generic: 9-byte header + arbitrary payload
 inline std::string make_frame(frame_type type, uint8_t flags,
@@ -162,6 +162,53 @@ inline std::vector<std::string> make_header_block_frames(
   return frames;
 }
 
+inline std::vector<std::string> make_push_promise_frames(
+    uint32_t stream_id, uint32_t promised_stream_id,
+    std::span<const uint8_t> header_block, uint8_t first_frame_flags,
+    uint32_t max_frame_size) {
+  size_t payload_limit = std::max<size_t>(4, max_frame_size);
+  size_t first_fragment_limit = payload_limit - 4;
+  std::vector<std::string> frames;
+
+  size_t offset = 0;
+  bool first = true;
+  do {
+    size_t chunk_size = first
+                            ? std::min(first_fragment_limit,
+                                       header_block.size() - offset)
+                            : std::min(payload_limit, header_block.size() - offset);
+    auto chunk = header_block.subspan(offset, chunk_size);
+    bool last = (offset + chunk_size) == header_block.size();
+
+    uint8_t frame_flags = first ? first_frame_flags : uint8_t(0);
+    if (last)
+      frame_flags |= flags::END_HEADERS;
+    else
+      frame_flags &= static_cast<uint8_t>(~flags::END_HEADERS);
+
+    if (first) {
+      std::vector<uint8_t> payload(4 + chunk.size());
+      payload[0] = uint8_t((promised_stream_id >> 24) & 0x7f);
+      payload[1] = uint8_t(promised_stream_id >> 16);
+      payload[2] = uint8_t(promised_stream_id >> 8);
+      payload[3] = uint8_t(promised_stream_id);
+      std::copy(chunk.begin(), chunk.end(), payload.begin() + 4);
+      frames.push_back(make_frame(
+          frame_type::push_promise, frame_flags, stream_id,
+          std::span<const uint8_t>(payload)));
+    }
+    else {
+      frames.push_back(make_frame(
+          frame_type::continuation, frame_flags, stream_id, chunk));
+    }
+
+    first = false;
+    offset += chunk_size;
+  } while (offset < header_block.size() || frames.empty());
+
+  return frames;
+}
+
 // SETTINGS frame (stream_id must be 0)
 inline std::string make_settings_frame(
     std::span<const settings_entry> entries = {}, bool ack = false) {
@@ -183,7 +230,7 @@ inline std::string make_settings_frame(
   return make_frame(frame_type::settings, f, 0, payload);
 }
 
-// Parse SETTINGS payload → list of entries
+// Parse SETTINGS payload -> list of entries
 inline std::vector<settings_entry> parse_settings_payload(
     std::span<const uint8_t> payload) {
   std::vector<settings_entry> out;
@@ -252,8 +299,8 @@ inline std::string make_window_update(uint32_t stream_id,
   return make_frame(frame_type::window_update, 0, stream_id, payload);
 }
 
-// ── Connection preface ───────────────────────────────────────────────────────
-// Client MUST send this 24-byte magic before any frames (RFC 7540 §3.5)
+// --- Connection preface ---
+// Client MUST send this 24-byte magic before any frames (RFC 7540 section 3.5)
 constexpr std::string_view CLIENT_PREFACE =
     "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
