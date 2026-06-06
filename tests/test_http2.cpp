@@ -4202,11 +4202,11 @@ TEST_CASE("DATA without END_STREAM yields batched WINDOW_UPDATE frames") {
 
   // Send multiple DATA frames totalling > half the initial window (32768+)
   // to trigger batched WINDOW_UPDATE. MAX_FRAME_SIZE is 16384.
-  constexpr size_t CHUNK = 16384;
+  constexpr size_t kChunkSize = 16384;
   constexpr int NUM_CHUNKS = 3;  // 3 * 16384 = 49152 > 32767 threshold
-  std::string chunk_data(CHUNK, 'X');
+  std::string chunk_data(kChunkSize, 'X');
   auto chunk_span = std::span<const uint8_t>(
-      reinterpret_cast<const uint8_t*>(chunk_data.data()), CHUNK);
+      reinterpret_cast<const uint8_t*>(chunk_data.data()), kChunkSize);
   for (int i = 0; i < NUM_CHUNKS; ++i) {
     auto data_frame = make_frame(frame_type::data, 0, 1, chunk_span);
     std::error_code ec;
