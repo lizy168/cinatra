@@ -20,8 +20,25 @@ struct header_field {
   std::string value;
 };
 
+struct header_field_view {
+  std::string_view name;
+  std::string_view value;
+};
+
 inline bool header_list_size_within_limit(std::span<const header_field> headers,
                                           uint32_t max_header_list_size) {
+  uint64_t total = 0;
+  for (auto& hf : headers) {
+    total += static_cast<uint64_t>(hf.name.size()) +
+             static_cast<uint64_t>(hf.value.size()) + 32;
+    if (total > max_header_list_size)
+      return false;
+  }
+  return true;
+}
+
+inline bool header_list_size_within_limit(
+    std::span<const header_field_view> headers, uint32_t max_header_list_size) {
   uint64_t total = 0;
   for (auto& hf : headers) {
     total += static_cast<uint64_t>(hf.name.size()) +
@@ -149,6 +166,10 @@ class dynamic_table {
     return {name_only, false};
   }
 
+  void add(std::string_view name, std::string_view value) {
+    add(std::string(name), std::string(value));
+  }
+
   void set_max_size(size_t s) {
     max_size_ = s;
     while (!entries_.empty() && current_size_ > max_size_) {
@@ -234,16 +255,19 @@ inline std::string decode_string(std::span<const uint8_t>& buf) {
 }
 
 inline void encode_string(std::vector<uint8_t>& out, std::string_view s) {
-  auto encoded = huffman_encode(s);
-  if (encoded.size() < s.size()) {
-    encode_integer(out, uint32_t(encoded.size()), 7, 0x80);
-    out.insert(out.end(), encoded.begin(), encoded.end());
+  auto encoded_size = huffman_encoded_size(s);
+  if (encoded_size < s.size()) {
+    encode_integer(out, uint32_t(encoded_size), 7, 0x80);
+    out.reserve(out.size() + encoded_size);
+    huffman_encode_append(out, s);
     return;
   }
 
   encode_integer(out, uint32_t(s.size()), 7, 0x00);
-  out.insert(out.end(), reinterpret_cast<const uint8_t*>(s.data()),
-             reinterpret_cast<const uint8_t*>(s.data()) + s.size());
+  if (!s.empty()) {
+    out.insert(out.end(), reinterpret_cast<const uint8_t*>(s.data()),
+               reinterpret_cast<const uint8_t*>(s.data()) + s.size());
+  }
 }
 
 // --- HPACK decoder ---
@@ -339,7 +363,19 @@ class hpack_encoder {
   // Strategy: indexed if found in static or dynamic table (name+value match),
   //           literal with incremental indexing otherwise.
   std::vector<uint8_t> encode(std::span<const header_field> headers) {
+    return encode_impl(headers);
+  }
+
+  std::vector<uint8_t> encode(std::span<const header_field_view> headers) {
+    return encode_impl(headers);
+  }
+
+ private:
+  template <typename HeaderSpan>
+  std::vector<uint8_t> encode_impl(HeaderSpan headers) {
     std::vector<uint8_t> out;
+    out.reserve(estimate_header_block_size(headers) +
+                (pending_table_size_update_ ? 8 : 0));
     if (pending_table_size_update_) {
       encode_integer(out, static_cast<uint32_t>(max_dynamic_size_), 5, 0x20);
       pending_table_size_update_ = false;
@@ -369,7 +405,15 @@ class hpack_encoder {
     return out;
   }
 
- private:
+  template <typename HeaderSpan>
+  static size_t estimate_header_block_size(HeaderSpan headers) {
+    size_t size = headers.size() * 3;
+    for (auto& hf : headers) {
+      size += hf.name.size() + hf.value.size();
+    }
+    return size;
+  }
+
   // Returns {index, value_also_matches}. Searches both static and dynamic
   // tables (RFC 7541 section 2.3.3). Prefers a full match over a name-only
   // match.

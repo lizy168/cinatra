@@ -6,6 +6,7 @@
 #include <async_simple/coro/Lazy.h>
 #include <async_simple/coro/Mutex.h>
 
+#include <array>
 #include <asio/ip/tcp.hpp>
 #include <atomic>
 #include <charconv>
@@ -600,7 +601,7 @@ class coro_http2_client {
     }
     if (!req.body.empty() && !saw_content_length) {
       request.append("Content-Length: ")
-          .append(std::to_string(req.body.size()))
+          .append(integer_to_string(req.body.size()))
           .append("\r\n");
     }
     request.append("\r\n").append(req.body);
@@ -644,6 +645,18 @@ class coro_http2_client {
     co_return !ec && n == data.size();
   }
 
+  async_simple::coro::Lazy<bool> write_data_frame(
+      uint32_t stream_id, uint8_t flags, std::span<const uint8_t> data) {
+    auto hdr =
+        make_frame_header(frame_type::data, flags, stream_id, data.size());
+    std::array<asio::const_buffer, 2> buffers{
+        asio::buffer(hdr), asio::buffer(data.data(), data.size())};
+
+    auto lock = co_await write_mutex_.coScopedLock();
+    auto [ec, n] = co_await write_to_peer(buffers);
+    co_return !ec && n == hdr.size() + data.size();
+  }
+
   template <typename AsioBuffer>
   async_simple::coro::Lazy<std::pair<std::error_code, size_t>> read_from_peer(
       AsioBuffer& buffer, size_t size_to_read) {
@@ -670,6 +683,21 @@ class coro_http2_client {
   async_simple::coro::Lazy<bool> write_header_block(
       uint32_t stream_id, const stream_state& st,
       std::span<const header_field> headers, uint8_t first_frame_flags) {
+    co_return co_await write_header_block_impl(stream_id, st, headers,
+                                               first_frame_flags);
+  }
+
+  async_simple::coro::Lazy<bool> write_header_block(
+      uint32_t stream_id, const stream_state& st,
+      std::span<const header_field_view> headers, uint8_t first_frame_flags) {
+    co_return co_await write_header_block_impl(stream_id, st, headers,
+                                               first_frame_flags);
+  }
+
+  template <typename HeaderSpan>
+  async_simple::coro::Lazy<bool> write_header_block_impl(
+      uint32_t stream_id, const stream_state& st, HeaderSpan headers,
+      uint8_t first_frame_flags) {
     auto header_lock = co_await header_mutex_.coScopedLock();
     auto write_lock = co_await write_mutex_.coScopedLock();
 
@@ -693,10 +721,18 @@ class coro_http2_client {
     return header_list_size_within_limit(headers, peer_max_header_list_size_);
   }
 
+  bool outbound_headers_within_peer_limit(
+      std::span<const header_field_view> headers) const {
+    return header_list_size_within_limit(headers, peer_max_header_list_size_);
+  }
+
   async_simple::coro::Lazy<bool> send_request(uint32_t stream_id,
                                               stream_state& st,
                                               const h2_client_request& req) {
-    std::vector<header_field> hdrs{{":method", req.method}};
+    std::string content_length_value;
+    std::vector<header_field_view> hdrs;
+    hdrs.reserve(4 + req.headers.size() + 1);
+    hdrs.push_back({":method", req.method});
     if (req.method == "CONNECT") {
       if (!req.protocol.empty()) {
         hdrs.push_back({":protocol", req.protocol});
@@ -710,9 +746,10 @@ class coro_http2_client {
       hdrs.push_back({":scheme", req.scheme});
       hdrs.push_back({":authority", req.authority});
     }
-    for (auto& hf : req.headers) hdrs.push_back(hf);
+    for (auto& hf : req.headers) hdrs.push_back({hf.name, hf.value});
     if (!req.body.empty() && !has_header(hdrs, "content-length")) {
-      hdrs.push_back({"content-length", std::to_string(req.body.size())});
+      content_length_value = integer_to_string(req.body.size());
+      hdrs.push_back({"content-length", content_length_value});
     }
 
     uint8_t hdr_flags = flags::END_HEADERS;
@@ -755,10 +792,10 @@ class coro_http2_client {
       auto data = std::span<const uint8_t>(
           reinterpret_cast<const uint8_t*>(req.body.data()) + offset, chunk);
       bool last = (offset + chunk) == req.body.size();
-      if (!co_await write_frame(make_frame(
-              frame_type::data,
+      if (!co_await write_data_frame(
+              stream_id,
               last && req.trailers.empty() ? flags::END_STREAM : uint8_t(0),
-              stream_id, data))) {
+              data)) {
         co_return false;
       }
       offset += chunk;
@@ -1582,13 +1619,22 @@ class coro_http2_client {
     return {};
   }
 
-  static bool has_header(const std::vector<header_field>& headers,
-                         std::string_view name) {
+  template <typename Headers>
+  static bool has_header(const Headers& headers, std::string_view name) {
     for (auto& hf : headers) {
       if (hf.name == name)
         return true;
     }
     return false;
+  }
+
+  template <typename Integer>
+  static std::string integer_to_string(Integer value) {
+    std::array<char, 32> buf{};
+    auto [ptr, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), value);
+    if (ec != std::errc{})
+      return {};
+    return {buf.data(), ptr};
   }
 
   static std::optional<uint64_t> parse_content_length(std::string_view value) {

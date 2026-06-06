@@ -89,10 +89,8 @@ inline size_t huffman_encoded_size(std::string_view s) {
   return (bit_count + 7) / 8;
 }
 
-inline std::vector<uint8_t> huffman_encode(std::string_view s) {
-  std::vector<uint8_t> out;
-  out.reserve(huffman_encoded_size(s));
-
+inline void huffman_encode_append(std::vector<uint8_t>& out,
+                                  std::string_view s) {
   uint64_t bit_buffer = 0;
   uint32_t bit_count = 0;
 
@@ -118,6 +116,12 @@ inline std::vector<uint8_t> huffman_encode(std::string_view s) {
                  ((uint64_t(1) << (8 - bit_count)) - 1);
     out.push_back(uint8_t(bit_buffer));
   }
+}
+
+inline std::vector<uint8_t> huffman_encode(std::string_view s) {
+  std::vector<uint8_t> out;
+  out.reserve(huffman_encoded_size(s));
+  huffman_encode_append(out, s);
 
   return out;
 }

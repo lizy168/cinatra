@@ -112,17 +112,23 @@ inline std::array<uint8_t, 9> serialize_frame_header(
 
 // --- Frame builders ---
 
-// Generic: 9-byte header + arbitrary payload
-inline std::string make_frame(frame_type type, uint8_t flags,
-                              uint32_t stream_id,
-                              std::span<const uint8_t> payload) {
+inline std::array<uint8_t, 9> make_frame_header(frame_type type, uint8_t flags,
+                                                uint32_t stream_id,
+                                                size_t payload_size) {
   frame_header h{
-      .length = uint32_t(payload.size()),
+      .length = uint32_t(payload_size),
       .type = type,
       .flags = flags,
       .stream_id = stream_id,
   };
-  auto hdr = serialize_frame_header(h);
+  return serialize_frame_header(h);
+}
+
+// Generic: 9-byte header + arbitrary payload
+inline std::string make_frame(frame_type type, uint8_t flags,
+                              uint32_t stream_id,
+                              std::span<const uint8_t> payload) {
+  auto hdr = make_frame_header(type, flags, stream_id, payload.size());
   std::string out(9 + payload.size(), '\0');
   std::copy(hdr.begin(), hdr.end(), out.begin());
   std::copy(payload.begin(), payload.end(), out.begin() + 9);

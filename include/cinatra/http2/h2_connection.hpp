@@ -6,6 +6,7 @@
 #include <async_simple/coro/Sleep.h>
 
 #include <algorithm>
+#include <array>
 #include <asio/ip/tcp.hpp>
 #include <atomic>
 #include <charconv>
@@ -672,6 +673,18 @@ class coro_http2_connection
     co_return !ec && n == data.size();
   }
 
+  async_simple::coro::Lazy<bool> write_data_frame(
+      uint32_t stream_id, uint8_t flags, std::span<const uint8_t> data) {
+    auto hdr =
+        make_frame_header(frame_type::data, flags, stream_id, data.size());
+    std::array<asio::const_buffer, 2> buffers{
+        asio::buffer(hdr), asio::buffer(data.data(), data.size())};
+
+    auto lock = co_await write_mutex_.coScopedLock();
+    auto [ec, n] = co_await write_to_peer(buffers);
+    co_return !ec && n == hdr.size() + data.size();
+  }
+
   template <typename AsioBuffer>
   async_simple::coro::Lazy<std::pair<std::error_code, size_t>>
   read_some_from_peer(AsioBuffer&& buffer) {
@@ -734,6 +747,20 @@ class coro_http2_connection
   async_simple::coro::Lazy<bool> write_header_block(
       uint32_t stream_id, std::span<const header_field> headers,
       uint8_t first_frame_flags) {
+    co_return co_await write_header_block_impl(stream_id, headers,
+                                               first_frame_flags);
+  }
+
+  async_simple::coro::Lazy<bool> write_header_block(
+      uint32_t stream_id, std::span<const header_field_view> headers,
+      uint8_t first_frame_flags) {
+    co_return co_await write_header_block_impl(stream_id, headers,
+                                               first_frame_flags);
+  }
+
+  template <typename HeaderSpan>
+  async_simple::coro::Lazy<bool> write_header_block_impl(
+      uint32_t stream_id, HeaderSpan headers, uint8_t first_frame_flags) {
     auto header_lock = co_await header_mutex_.coScopedLock();
     auto write_lock = co_await write_mutex_.coScopedLock();
 
@@ -1904,13 +1931,18 @@ class coro_http2_connection
       co_return false;
     }
 
-    auto resp_hdrs = build_response_headers(resp);
-    if (!outbound_headers_within_peer_limit(resp_hdrs) ||
-        !outbound_headers_within_peer_limit(resp.trailers)) {
+    if (!response_header_blocks_within_peer_limit(resp)) {
       abort_stream(stream_id);
       co_return co_await write_frame(
           make_rst_stream(stream_id, h2_error_code::internal_error));
     }
+
+    std::string status_value = integer_to_string(resp.status_code);
+    std::string content_length_value;
+    if (!resp.body.empty() && !has_header(resp.headers, "content-length"))
+      content_length_value = integer_to_string(resp.body.size());
+    auto resp_hdrs =
+        build_response_header_views(resp, status_value, content_length_value);
 
     uint8_t hdr_flags = flags::END_HEADERS;
     if (resp.body.empty() && resp.trailers.empty())
@@ -1949,9 +1981,8 @@ class coro_http2_connection
             (offset + chunk == resp.body.size()) && resp.trailers.empty();
         auto span = std::span<const uint8_t>(
             reinterpret_cast<const uint8_t*>(resp.body.data()) + offset, chunk);
-        if (!co_await write_frame(make_frame(
-                frame_type::data, last ? flags::END_STREAM : uint8_t(0),
-                stream_id, span))) {
+        if (!co_await write_data_frame(
+                stream_id, last ? flags::END_STREAM : uint8_t(0), span)) {
           co_return false;
         }
         offset += chunk;
@@ -2583,25 +2614,75 @@ class coro_http2_connection
     return false;
   }
 
+  template <typename Integer>
+  static std::string integer_to_string(Integer value) {
+    std::array<char, 32> buf{};
+    auto [ptr, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), value);
+    if (ec != std::errc{})
+      return {};
+    return {buf.data(), ptr};
+  }
+
+  static size_t decimal_digit_count(uint64_t value) noexcept {
+    size_t digits = 1;
+    while (value >= 10) {
+      value /= 10;
+      ++digits;
+    }
+    return digits;
+  }
+
+  static bool add_header_list_size(uint64_t& total, size_t name_size,
+                                   size_t value_size,
+                                   uint32_t max_header_list_size) noexcept {
+    total += static_cast<uint64_t>(name_size) +
+             static_cast<uint64_t>(value_size) + 32;
+    return total <= max_header_list_size;
+  }
+
   bool outbound_headers_within_peer_limit(
       std::span<const header_field> headers) const {
     return header_list_size_within_limit(headers, peer_max_header_list_size_);
   }
 
-  static std::vector<header_field> build_response_headers(
-      const h2_response& resp) {
-    std::vector<header_field> resp_hdrs;
-    resp_hdrs.push_back({":status", std::to_string(resp.status_code)});
-    if (!resp.body.empty() && !has_header(resp.headers, "content-length"))
-      resp_hdrs.push_back({"content-length", std::to_string(resp.body.size())});
-    for (auto& hf : resp.headers) resp_hdrs.push_back(hf);
+  bool outbound_headers_within_peer_limit(
+      std::span<const header_field_view> headers) const {
+    return header_list_size_within_limit(headers, peer_max_header_list_size_);
+  }
+
+  static std::vector<header_field_view> build_response_header_views(
+      const h2_response& resp, std::string_view status_value,
+      std::string_view content_length_value) {
+    std::vector<header_field_view> resp_hdrs;
+    resp_hdrs.reserve(1 + resp.headers.size() +
+                      (content_length_value.empty() ? 0 : 1));
+    resp_hdrs.push_back({":status", status_value});
+    if (!content_length_value.empty())
+      resp_hdrs.push_back({"content-length", content_length_value});
+    for (auto& hf : resp.headers) resp_hdrs.push_back({hf.name, hf.value});
     return resp_hdrs;
   }
 
   bool response_header_blocks_within_peer_limit(const h2_response& resp) const {
-    auto resp_hdrs = build_response_headers(resp);
-    return outbound_headers_within_peer_limit(resp_hdrs) &&
-           outbound_headers_within_peer_limit(resp.trailers);
+    uint64_t total = 0;
+    if (!add_header_list_size(total, std::string_view(":status").size(),
+                              decimal_digit_count(resp.status_code),
+                              peer_max_header_list_size_)) {
+      return false;
+    }
+    if (!resp.body.empty() && !has_header(resp.headers, "content-length") &&
+        !add_header_list_size(total, std::string_view("content-length").size(),
+                              decimal_digit_count(resp.body.size()),
+                              peer_max_header_list_size_)) {
+      return false;
+    }
+    for (auto& hf : resp.headers) {
+      if (!add_header_list_size(total, hf.name.size(), hf.value.size(),
+                                peer_max_header_list_size_)) {
+        return false;
+      }
+    }
+    return outbound_headers_within_peer_limit(resp.trailers);
   }
 
 #ifdef CINATRA_ENABLE_SSL
