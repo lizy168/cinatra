@@ -9,9 +9,9 @@
 #include <optional>
 #include <regex>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <vector>
-#include <string>
 
 #include "async_simple/coro/Lazy.h"
 #include "define.h"
@@ -39,9 +39,8 @@ inline std::vector<std::pair<int, int>> parse_ranges(std::string_view range_str,
     return {};
   }
 
-  auto file_last = static_cast<int>(
-      (std::min)(file_size - 1,
-                 static_cast<size_t>(std::numeric_limits<int>::max())));
+  auto file_last = static_cast<int>((std::min)(
+      file_size - 1, static_cast<size_t>(std::numeric_limits<int>::max())));
   range_str = trim_sv(range_str);
   if (range_str.empty()) {
     return {{0, file_last}};
@@ -95,8 +94,8 @@ inline std::vector<std::pair<int, int>> parse_ranges(std::string_view range_str,
       }
     }
 
-    if (start > 0 && (static_cast<size_t>(start) >= file_size ||
-                      start == end)) {
+    if (start > 0 &&
+        (static_cast<size_t>(start) >= file_size || start == end)) {
       // out of range
       is_valid = false;
       return {};
@@ -126,12 +125,14 @@ class coro_http_request {
 #endif
   coro_http_request(http_parser &parser, coro_http_connection *conn)
 #ifdef CINATRA_ENABLE_SSL
-      : parser_(&parser), conn_(conn) {}
+      : parser_(&parser),
+        conn_(conn){}
 #else
-      : parser_(parser), conn_(conn) {}
+      : parser_(parser), conn_(conn) {
+  }
 #endif
 
-  std::string_view get_header_value(std::string_view key) {
+        std::string_view get_header_value(std::string_view key) {
 #ifndef CINATRA_ENABLE_SSL
     auto headers = parser_.get_headers();
 #else
@@ -342,8 +343,7 @@ class coro_http_request {
 
 #ifdef CINATRA_ENABLE_SSL
   std::string_view get_scheme() const {
-    return protocol_request_ ? protocol_request_->scheme()
-                             : std::string_view{};
+    return protocol_request_ ? protocol_request_->scheme() : std::string_view{};
   }
 
   std::string_view get_authority() const {
@@ -477,28 +477,24 @@ class coro_http_request {
   friend class http2::coro_http2_connection;
 
   template <typename ProtocolRequest, typename... Args>
-  ProtocolRequest& reset_protocol_request(coro_http_connection *conn,
-                                          Args&&... args) {
+  ProtocolRequest &reset_protocol_request(coro_http_connection *conn,
+                                          Args &&...args) {
     clear();
     parser_ = nullptr;
     conn_ = conn;
     is_websocket_ = false;
-    auto request = std::make_shared<ProtocolRequest>(
-        std::forward<Args>(args)...);
-    auto& ref = *request;
+    auto request =
+        std::make_shared<ProtocolRequest>(std::forward<Args>(args)...);
+    auto &ref = *request;
     protocol_request_ = std::move(request);
     return ref;
   }
 #endif
 
 #ifdef CINATRA_ENABLE_SSL
-  bool has_parser() const {
-    return parser_ != nullptr;
-  }
+  bool has_parser() const { return parser_ != nullptr; }
 
-  http_parser& parser() const {
-    return *parser_;
-  }
+  http_parser &parser() const { return *parser_; }
 #endif
 
 #ifdef CINATRA_ENABLE_SSL

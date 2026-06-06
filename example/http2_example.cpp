@@ -1,9 +1,9 @@
+#include <async_simple/coro/SyncAwait.h>
+
+#include <asio/io_context.hpp>
 #include <chrono>
 #include <iostream>
 #include <thread>
-
-#include <asio/io_context.hpp>
-#include <async_simple/coro/SyncAwait.h>
 
 #include "cinatra/coro_http_server.hpp"
 #include "cinatra/http2/h2_client.hpp"
@@ -19,15 +19,17 @@ int main() {
   auto work = asio::make_work_guard(ioc);
   coro_io::ExecutorWrapper<> exec(ioc.get_executor());
 
-  std::thread io_thread([&ioc] { ioc.run(); });
+  std::thread io_thread([&ioc] {
+    ioc.run();
+  });
 
   cinatra::coro_http_server server(ioc, 0);
   server.set_http2_mode(cinatra::http2_mode::required);
   server.init_ssl("include/cinatra/server.crt", "include/cinatra/server.key",
                   "test");
   server.set_http_handler<cinatra::GET>(
-      "/hello", [](cinatra::coro_http_request& req,
-                    cinatra::coro_http_response& resp) {
+      "/hello",
+      [](cinatra::coro_http_request& req, cinatra::coro_http_response& resp) {
         resp.add_header("content-type", "text/plain");
         resp.set_status_and_content(
             cinatra::status_type::ok,

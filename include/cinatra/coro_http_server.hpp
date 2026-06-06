@@ -769,8 +769,8 @@ class coro_http_server {
                        require_http2);
         if (enable_http2_alpn) {
           conn->set_ssl_http2_handler(
-              [this, executor](
-                  coro_http_connection::ssl_stream_type &ssl_stream)
+              [this,
+               executor](coro_http_connection::ssl_stream_type &ssl_stream)
                   -> async_simple::coro::Lazy<void> {
                 auto h2_conn = std::make_shared<http2::coro_http2_connection>(
                     ssl_stream,

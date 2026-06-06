@@ -1,12 +1,11 @@
 #include <any>
+#include <asio/io_context.hpp>
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <thread>
-
-#include <asio/io_context.hpp>
 
 #include "cinatra/coro_http_server.hpp"
 #include "cinatra/http2/h2_connection.hpp"
@@ -80,8 +79,7 @@ int main(int argc, char** argv) {
   server.set_enable_http2_connect_protocol(true);
   server.set_default_handler(
       [](cinatra::coro_http_request& req,
-         cinatra::coro_http_response& resp)
-          -> async_simple::coro::Lazy<void> {
+         cinatra::coro_http_response& resp) -> async_simple::coro::Lazy<void> {
         bool needs_flow_control_probe_body = false;
         if (auto metadata = req.get_user_data(); metadata.has_value()) {
           if (auto* http2_metadata =
@@ -102,8 +100,8 @@ int main(int argc, char** argv) {
   server.async_start();
   auto bound_port = server.port();
   std::cout << "http2_conformance_server listening on "
-            << "https://127.0.0.1:" << bound_port << " threads="
-            << thread_count << '\n';
+            << "https://127.0.0.1:" << bound_port << " threads=" << thread_count
+            << '\n';
   std::cout.flush();
 
   std::this_thread::sleep_for(std::chrono::seconds(duration_seconds));

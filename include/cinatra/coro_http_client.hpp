@@ -1438,8 +1438,7 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
 #ifdef CINATRA_ENABLE_SSL
     if (socket_->has_closed_ && !uri.empty() && uri[0] == '/') {
       std::string_view path(uri.data(), uri.size());
-      if (auto h2_resp =
-              co_await try_http2_request(path, method, ctx, headers);
+      if (auto h2_resp = co_await try_http2_request(path, method, ctx, headers);
           h2_resp) {
         co_return *h2_resp;
       }
@@ -1681,8 +1680,7 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
   }
 
 #ifdef CINATRA_ENABLE_SSL
-  resp_data make_http2_resp_data(
-      http2::h2_client_adapter_response &&h2_resp) {
+  resp_data make_http2_resp_data(http2::h2_client_adapter_response &&h2_resp) {
     body_ = std::move(h2_resp.body);
     http2_header_storage_ = std::move(h2_resp.headers);
     http2_resp_headers_.clear();
@@ -1695,9 +1693,8 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
     data.net_err = h2_resp.net_err;
     data.status = h2_resp.status;
     data.resp_body = body_;
-    data.resp_headers =
-        std::span<http_header>(http2_resp_headers_.data(),
-                               http2_resp_headers_.size());
+    data.resp_headers = std::span<http_header>(http2_resp_headers_.data(),
+                                               http2_resp_headers_.size());
     return data;
   }
 
@@ -1757,8 +1754,8 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
   async_simple::coro::Lazy<std::optional<resp_data>> try_http2_connect(
       const uri_t &u) {
     bool is_websocket = u.schema == "ws"sv || u.schema == "wss"sv;
-    if (!enable_http2_ || !u.is_ssl || is_websocket ||
-        !proxy_host_.empty() || !proxy_port_.empty()) {
+    if (!enable_http2_ || !u.is_ssl || is_websocket || !proxy_host_.empty() ||
+        !proxy_port_.empty()) {
       co_return std::nullopt;
     }
     if (http2_adapter_ == nullptr) {

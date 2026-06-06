@@ -207,9 +207,9 @@ class coro_http_router {
 
   async_simple::coro::Lazy<void> dispatch(
       coro_http_request& req, coro_http_response& resp,
-      const std::function<async_simple::coro::Lazy<void>(
-          coro_http_request&, coro_http_response&)>* default_handler =
-          nullptr) {
+      const std::function<async_simple::coro::Lazy<void>(coro_http_request&,
+                                                         coro_http_response&)>*
+          default_handler = nullptr) {
     req.params_.clear();
     req.matches_ = std::smatch{};
     std::string key;
@@ -232,7 +232,7 @@ class coro_http_router {
     bool is_exist = false;
     bool is_coro_exist = false;
     bool is_matched_regex_router = false;
-    std::function<void(coro_http_request& req, coro_http_response& resp)>
+    std::function<void(coro_http_request & req, coro_http_response & resp)>
         handler;
     std::string method_str(req.get_method());
     std::string url_path = method_str;
@@ -249,8 +249,8 @@ class coro_http_router {
       co_return;
     }
 
-    std::function<async_simple::coro::Lazy<void>(coro_http_request& req,
-                                                 coro_http_response& resp)>
+    std::function<async_simple::coro::Lazy<void>(coro_http_request & req,
+                                                 coro_http_response & resp)>
         coro_handler;
 
     std::tie(is_coro_exist, coro_handler, req.params_) =

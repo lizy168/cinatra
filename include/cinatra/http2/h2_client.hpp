@@ -22,8 +22,8 @@
 #include <vector>
 
 #include "cinatra/ylt/coro_io/coro_io.hpp"
-#include "h2_connection.hpp"
 #include "frame.hpp"
+#include "h2_connection.hpp"
 #include "hpack.hpp"
 
 namespace cinatra::http2 {
@@ -48,11 +48,11 @@ struct h2_client_request {
 };
 
 struct h2_client_response {
-  std::error_code             net_err;
-  int                         status_code = 0;
-  std::string                 body;
-  std::vector<header_field>   headers;
-  std::vector<header_field>   trailers;
+  std::error_code net_err;
+  int status_code = 0;
+  std::string body;
+  std::vector<header_field> headers;
+  std::vector<header_field> trailers;
 };
 
 struct h2_pushed_response {
@@ -69,8 +69,7 @@ class coro_http2_client {
 
   explicit coro_http2_client(
       coro_io::ExecutorWrapper<>* executor = coro_io::get_global_executor())
-      : executor_(executor),
-        socket_(executor->get_asio_executor()) {}
+      : executor_(executor), socket_(executor->get_asio_executor()) {}
 
   ~coro_http2_client() { close(); }
 
@@ -80,8 +79,7 @@ class coro_http2_client {
 
   void set_use_h2c_upgrade(bool enabled) { use_h2c_upgrade_ = enabled; }
 
-  void set_push_handler(
-      std::function<void(h2_pushed_response)> handler) {
+  void set_push_handler(std::function<void(h2_pushed_response)> handler) {
     push_handler_ = std::move(handler);
   }
 
@@ -90,16 +88,16 @@ class coro_http2_client {
                 const std::string& base_path = {},
                 const std::string& cert_file = {},
                 const std::string& sni_hostname = {}) {
-    if (has_init_ssl_) return true;
+    if (has_init_ssl_)
+      return true;
 
     try {
       ssl_ctx_ =
           std::make_unique<asio::ssl::context>(asio::ssl::context::sslv23);
-      ssl_ctx_->set_options(asio::ssl::context::default_workarounds |
-                            asio::ssl::context::no_sslv2 |
-                            asio::ssl::context::no_sslv3 |
-                            asio::ssl::context::no_tlsv1 |
-                            asio::ssl::context::no_tlsv1_1);
+      ssl_ctx_->set_options(
+          asio::ssl::context::default_workarounds |
+          asio::ssl::context::no_sslv2 | asio::ssl::context::no_sslv3 |
+          asio::ssl::context::no_tlsv1 | asio::ssl::context::no_tlsv1_1);
       auto full_cert_file = std::filesystem::path(base_path).append(cert_file);
       if (std::filesystem::exists(full_cert_file)) {
         ssl_ctx_->load_verify_file(full_cert_file.string());
@@ -114,8 +112,7 @@ class coro_http2_client {
       ssl_ctx_->set_verify_mode(verify_mode);
       ssl_sni_hostname_ = sni_hostname;
       has_init_ssl_ = true;
-    }
-    catch (...) {
+    } catch (...) {
       return false;
     }
     return true;
@@ -128,14 +125,16 @@ class coro_http2_client {
     bool want_ssl = false;
     {
       std::scoped_lock lock(state_mutex_);
-      if (connected_) co_return std::error_code{};
+      if (connected_)
+        co_return std::error_code{};
       host_ = std::move(host);
       port_ = std::move(port);
       scheme_ = std::move(scheme);
       authority_ = authority.empty() ? host_ : std::move(authority);
 #ifdef CINATRA_ENABLE_SSL
       want_ssl = has_init_ssl_ || scheme_ == "https";
-      if (want_ssl && scheme_ == "http") scheme_ = "https";
+      if (want_ssl && scheme_ == "http")
+        scheme_ = "https";
       use_ssl_ = false;
 #else
       want_ssl = scheme_ == "https";
@@ -178,8 +177,8 @@ class coro_http2_client {
     }
 #endif
 
-    if (auto ec = co_await coro_io::async_connect(
-            executor_, socket_, host_, port_);
+    if (auto ec =
+            co_await coro_io::async_connect(executor_, socket_, host_, port_);
         ec) {
       std::scoped_lock lock(state_mutex_);
       connected_ = false;
@@ -254,8 +253,10 @@ class coro_http2_client {
           resp.net_err = std::make_error_code(std::errc::not_connected);
           co_return resp;
         }
-        if (req.scheme.empty()) req.scheme = scheme_;
-        if (req.authority.empty()) req.authority = authority_;
+        if (req.scheme.empty())
+          req.scheme = scheme_;
+        if (req.authority.empty())
+          req.authority = authority_;
 
         stream_id = 1;
         next_stream_id_ = 3;
@@ -269,19 +270,23 @@ class coro_http2_client {
       }
     }
     while (true) {
-      if (used_h2c_upgrade) break;
+      if (used_h2c_upgrade)
+        break;
       {
         auto stream_limit_lock = co_await stream_limit_mutex_.coScopedLock();
-        co_await stream_limit_cv_.wait(stream_limit_mutex_, [this, request_ticket] {
-          if (!connected_.load() || connection_closed_.load() ||
-              going_away_.load()) {
-            return true;
-          }
-          if (request_start_turn_.load() != request_ticket) return false;
-          if (!peer_settings_ready_.load()) return false;
-          return active_stream_count_.load() <
-                 peer_max_concurrent_streams_.load();
-        });
+        co_await stream_limit_cv_.wait(
+            stream_limit_mutex_, [this, request_ticket] {
+              if (!connected_.load() || connection_closed_.load() ||
+                  going_away_.load()) {
+                return true;
+              }
+              if (request_start_turn_.load() != request_ticket)
+                return false;
+              if (!peer_settings_ready_.load())
+                return false;
+              return active_stream_count_.load() <
+                     peer_max_concurrent_streams_.load();
+            });
         {
           std::scoped_lock lock(state_mutex_);
           if (!connected_ || connection_closed_ || going_away_) {
@@ -299,8 +304,10 @@ class coro_http2_client {
               peer_max_concurrent_streams_.load()) {
             continue;
           }
-          if (req.scheme.empty()) req.scheme = scheme_;
-          if (req.authority.empty()) req.authority = authority_;
+          if (req.scheme.empty())
+            req.scheme = scheme_;
+          if (req.authority.empty())
+            req.authority = authority_;
 
           stream_id = next_stream_id_;
           next_stream_id_ += 2;
@@ -333,7 +340,8 @@ class coro_http2_client {
       if (!co_await send_h2c_upgrade_request(stream_id, *st, req)) {
         if (!st->done_signaled.load()) {
           if (!st->resp.net_err) {
-            st->resp.net_err = std::make_error_code(std::errc::connection_aborted);
+            st->resp.net_err =
+                std::make_error_code(std::errc::connection_aborted);
           }
           finish_stream(st);
         }
@@ -350,7 +358,8 @@ class coro_http2_client {
     if (!co_await send_request(stream_id, *st, req)) {
       if (!st->done_signaled.load()) {
         if (!st->resp.net_err) {
-          st->resp.net_err = std::make_error_code(std::errc::connection_aborted);
+          st->resp.net_err =
+              std::make_error_code(std::errc::connection_aborted);
         }
         finish_stream(st);
       }
@@ -387,30 +396,30 @@ class coro_http2_client {
     }
 
     std::unique_lock lock(read_loop_mutex_);
-    read_loop_cv_.wait(lock, [this] { return !read_loop_running_; });
+    read_loop_cv_.wait(lock, [this] {
+      return !read_loop_running_;
+    });
   }
 
  private:
   struct stream_state {
     stream_state() : future(promise.getFuture()) {}
 
-    h2_client_request                   req;
-    h2_client_response                  resp;
-    std::vector<uint8_t>                hdr_block_buf;
-    uint32_t                            stream_id = 0;
-    int32_t                             recv_window =
-        static_cast<int32_t>(DEFAULT_WINDOW_SIZE);
-    uint32_t                            recv_pending = 0;
-    int32_t                             send_window =
-        static_cast<int32_t>(DEFAULT_WINDOW_SIZE);
-    std::atomic<bool>                   done_signaled = false;
-    std::optional<uint64_t>             content_length;
-    bool                                final_response_received = false;
-    bool                                trailing_headers_received = false;
-    bool                                is_pushed = false;
-    uint32_t                            associated_stream_id = 0;
+    h2_client_request req;
+    h2_client_response resp;
+    std::vector<uint8_t> hdr_block_buf;
+    uint32_t stream_id = 0;
+    int32_t recv_window = static_cast<int32_t>(DEFAULT_WINDOW_SIZE);
+    uint32_t recv_pending = 0;
+    int32_t send_window = static_cast<int32_t>(DEFAULT_WINDOW_SIZE);
+    std::atomic<bool> done_signaled = false;
+    std::optional<uint64_t> content_length;
+    bool final_response_received = false;
+    bool trailing_headers_received = false;
+    bool is_pushed = false;
+    uint32_t associated_stream_id = 0;
     async_simple::Promise<h2_client_response> promise;
-    async_simple::Future<h2_client_response>  future;
+    async_simple::Future<h2_client_response> future;
   };
 
   struct payload_view_result {
@@ -433,7 +442,8 @@ class coro_http2_client {
 
   void start_read_loop() {
     std::scoped_lock lock(read_loop_mutex_);
-    if (read_loop_running_) return;
+    if (read_loop_running_)
+      return;
     read_loop_running_ = true;
     read_loop().via(executor_).start([this](auto&&) {
       {
@@ -474,13 +484,11 @@ class coro_http2_client {
       else if (ch == '/')
         ch = '_';
     }
-    while (!encoded.empty() && encoded.back() == '=')
-      encoded.pop_back();
+    while (!encoded.empty() && encoded.back() == '=') encoded.pop_back();
     return encoded;
   }
 
-  async_simple::coro::Lazy<bool> read_h2c_upgrade_response(
-      stream_state& st) {
+  async_simple::coro::Lazy<bool> read_h2c_upgrade_response(stream_state& st) {
     std::string response;
     response.reserve(256);
     std::array<char, 1> ch{};
@@ -489,7 +497,8 @@ class coro_http2_client {
       auto buf = asio::buffer(ch);
       auto [ec, n] = co_await read_from_peer(buf, 1);
       if (ec || n != 1) {
-        st.resp.net_err = ec ? ec : std::make_error_code(std::errc::connection_aborted);
+        st.resp.net_err =
+            ec ? ec : std::make_error_code(std::errc::connection_aborted);
         co_return false;
       }
       response.push_back(ch[0]);
@@ -508,7 +517,8 @@ class coro_http2_client {
     }
     auto status_line = std::string_view(response.data(), status_end);
     size_t sp1 = status_line.find(' ');
-    size_t sp2 = status_line.find(' ', sp1 == std::string_view::npos ? 0 : sp1 + 1);
+    size_t sp2 =
+        status_line.find(' ', sp1 == std::string_view::npos ? 0 : sp1 + 1);
     if (sp1 == std::string_view::npos || sp2 == std::string_view::npos ||
         status_line.substr(0, sp1) != "HTTP/1.1" ||
         status_line.substr(sp1 + 1, sp2 - sp1 - 1) != "101") {
@@ -533,7 +543,8 @@ class coro_http2_client {
         co_return false;
       }
 
-      auto name = ascii_lower_copy(trim_optional_whitespace(line.substr(0, colon)));
+      auto name =
+          ascii_lower_copy(trim_optional_whitespace(line.substr(0, colon)));
       auto value = trim_optional_whitespace(line.substr(colon + 1));
       if (name == "connection") {
         saw_connection_upgrade = token_list_contains(value, "upgrade");
@@ -638,7 +649,8 @@ class coro_http2_client {
       AsioBuffer& buffer, size_t size_to_read) {
 #ifdef CINATRA_ENABLE_SSL
     if (use_ssl_) {
-      co_return co_await coro_io::async_read(*ssl_stream_, buffer, size_to_read);
+      co_return co_await coro_io::async_read(*ssl_stream_, buffer,
+                                             size_to_read);
     }
 #endif
     co_return co_await coro_io::async_read(socket_, buffer, size_to_read);
@@ -657,8 +669,7 @@ class coro_http2_client {
 
   async_simple::coro::Lazy<bool> write_header_block(
       uint32_t stream_id, const stream_state& st,
-      std::span<const header_field> headers,
-      uint8_t first_frame_flags) {
+      std::span<const header_field> headers, uint8_t first_frame_flags) {
     auto header_lock = co_await header_mutex_.coScopedLock();
     auto write_lock = co_await write_mutex_.coScopedLock();
 
@@ -682,8 +693,9 @@ class coro_http2_client {
     return header_list_size_within_limit(headers, peer_max_header_list_size_);
   }
 
-  async_simple::coro::Lazy<bool> send_request(
-      uint32_t stream_id, stream_state& st, const h2_client_request& req) {
+  async_simple::coro::Lazy<bool> send_request(uint32_t stream_id,
+                                              stream_state& st,
+                                              const h2_client_request& req) {
     std::vector<header_field> hdrs{{":method", req.method}};
     if (req.method == "CONNECT") {
       if (!req.protocol.empty()) {
@@ -737,16 +749,16 @@ class coro_http2_client {
       if (!can_send_stream(stream_id, st))
         co_return false;
       auto chunk = co_await reserve_send_window(st, req.body.size() - offset);
-      if (chunk == 0) co_return false;
+      if (chunk == 0)
+        co_return false;
 
       auto data = std::span<const uint8_t>(
           reinterpret_cast<const uint8_t*>(req.body.data()) + offset, chunk);
       bool last = (offset + chunk) == req.body.size();
-      if (!co_await write_frame(make_frame(frame_type::data,
-                                           last && req.trailers.empty()
-                                               ? flags::END_STREAM
-                                               : uint8_t(0),
-                                           stream_id, data))) {
+      if (!co_await write_frame(make_frame(
+              frame_type::data,
+              last && req.trailers.empty() ? flags::END_STREAM : uint8_t(0),
+              stream_id, data))) {
         co_return false;
       }
       offset += chunk;
@@ -754,8 +766,9 @@ class coro_http2_client {
 
     if (!req.trailers.empty()) {
       if (!can_send_stream(stream_id, st) ||
-          !co_await write_header_block(stream_id, st, req.trailers,
-                                       flags::END_HEADERS | flags::END_STREAM)) {
+          !co_await write_header_block(
+              stream_id, st, req.trailers,
+              flags::END_HEADERS | flags::END_STREAM)) {
         co_return false;
       }
     }
@@ -814,10 +827,11 @@ class coro_http2_client {
       payload_buf_.resize(hdr.length);
       if (hdr.length > 0) {
         auto payload_buf_view = asio::buffer(payload_buf_);
-        auto [read_ec, read_n] = co_await read_from_peer(
-            payload_buf_view, hdr.length);
+        auto [read_ec, read_n] =
+            co_await read_from_peer(payload_buf_view, hdr.length);
         if (read_ec || read_n != hdr.length) {
-          end_ec = read_ec ? read_ec : std::make_error_code(std::errc::connection_reset);
+          end_ec = read_ec ? read_ec
+                           : std::make_error_code(std::errc::connection_reset);
           break;
         }
       }
@@ -857,24 +871,36 @@ class coro_http2_client {
     }
 
     switch (hdr.type) {
-      case frame_type::settings:      co_return co_await on_settings(hdr, payload);
-      case frame_type::headers:       co_return co_await on_headers(hdr, payload);
-      case frame_type::continuation:  co_return co_await on_continuation(hdr, payload);
-      case frame_type::data:          co_return co_await on_data(hdr, payload);
-      case frame_type::priority:      co_return co_await on_priority(hdr, payload);
-      case frame_type::ping:          co_return co_await on_ping(hdr, payload);
-      case frame_type::push_promise:  co_return co_await on_push_promise(hdr, payload);
-      case frame_type::rst_stream:    co_return co_await on_rst_stream(hdr, payload);
-      case frame_type::goaway:        co_return co_await on_goaway(hdr, payload);
-      case frame_type::window_update: co_return co_await on_window_update(hdr, payload);
-      default:                        co_return true;
+      case frame_type::settings:
+        co_return co_await on_settings(hdr, payload);
+      case frame_type::headers:
+        co_return co_await on_headers(hdr, payload);
+      case frame_type::continuation:
+        co_return co_await on_continuation(hdr, payload);
+      case frame_type::data:
+        co_return co_await on_data(hdr, payload);
+      case frame_type::priority:
+        co_return co_await on_priority(hdr, payload);
+      case frame_type::ping:
+        co_return co_await on_ping(hdr, payload);
+      case frame_type::push_promise:
+        co_return co_await on_push_promise(hdr, payload);
+      case frame_type::rst_stream:
+        co_return co_await on_rst_stream(hdr, payload);
+      case frame_type::goaway:
+        co_return co_await on_goaway(hdr, payload);
+      case frame_type::window_update:
+        co_return co_await on_window_update(hdr, payload);
+      default:
+        co_return true;
     }
   }
 
-  async_simple::coro::Lazy<bool> on_settings(
-      const frame_header& hdr, std::span<const uint8_t> payload) {
-    if (hdr.stream_id != 0) co_return fail_connection(
-        std::make_error_code(std::errc::protocol_error));
+  async_simple::coro::Lazy<bool> on_settings(const frame_header& hdr,
+                                             std::span<const uint8_t> payload) {
+    if (hdr.stream_id != 0)
+      co_return fail_connection(
+          std::make_error_code(std::errc::protocol_error));
     if (hdr.flags & flags::ACK) {
       if (hdr.length != 0) {
         co_return fail_connection(
@@ -882,8 +908,8 @@ class coro_http2_client {
       }
       co_return true;
     }
-    if ((hdr.length % 6) != 0) co_return fail_connection(
-        std::make_error_code(std::errc::message_size));
+    if ((hdr.length % 6) != 0)
+      co_return fail_connection(std::make_error_code(std::errc::message_size));
 
     uint32_t peer_initial = peer_initial_window_size_;
     uint32_t peer_frame = peer_max_frame_size_;
@@ -898,16 +924,18 @@ class coro_http2_client {
           // RFC 7540 §6.5.2: server MUST NOT set ENABLE_PUSH to anything
           // other than 0. Receipt of any other value from the server is
           // a connection error.
-          if (setting.value != 0) co_return fail_connection(
-              std::make_error_code(std::errc::protocol_error));
+          if (setting.value != 0)
+            co_return fail_connection(
+                std::make_error_code(std::errc::protocol_error));
           break;
         case settings_param::max_concurrent_streams:
           peer_concurrent = setting.value;
           notify_stream_limit = true;
           break;
         case settings_param::initial_window_size:
-          if (setting.value > MAX_WINDOW_SIZE) co_return fail_connection(
-              std::make_error_code(std::errc::no_buffer_space));
+          if (setting.value > MAX_WINDOW_SIZE)
+            co_return fail_connection(
+                std::make_error_code(std::errc::no_buffer_space));
           peer_initial = setting.value;
           break;
         case settings_param::max_frame_size:
@@ -922,8 +950,9 @@ class coro_http2_client {
           peer_max_header_list_size_ = setting.value;
           break;
         case settings_param::enable_connect_protocol:
-          if (setting.value > 1) co_return fail_connection(
-              std::make_error_code(std::errc::protocol_error));
+          if (setting.value > 1)
+            co_return fail_connection(
+                std::make_error_code(std::errc::protocol_error));
           peer_enable_connect_protocol_ = setting.value == 1;
           break;
       }
@@ -940,8 +969,9 @@ class coro_http2_client {
       auto lock = co_await send_window_mutex_.coScopedLock();
       for (auto& st : streams) {
         int64_t next = static_cast<int64_t>(st->send_window) + delta;
-        if (next < 0 || next > MAX_WINDOW_SIZE) co_return fail_connection(
-            std::make_error_code(std::errc::no_buffer_space));
+        if (next < 0 || next > MAX_WINDOW_SIZE)
+          co_return fail_connection(
+              std::make_error_code(std::errc::no_buffer_space));
         st->send_window = static_cast<int32_t>(next);
       }
       peer_initial_window_size_ = peer_initial;
@@ -957,25 +987,26 @@ class coro_http2_client {
       auto stream_limit_lock = co_await stream_limit_mutex_.coScopedLock();
       peer_max_concurrent_streams_ = peer_concurrent;
       first_peer_settings = !peer_settings_ready_.exchange(true);
-      if (first_peer_settings || notify_stream_limit) stream_limit_cv_.notifyAll();
+      if (first_peer_settings || notify_stream_limit)
+        stream_limit_cv_.notifyAll();
     }
     co_return true;
   }
 
   async_simple::coro::Lazy<bool> on_window_update(
       const frame_header& hdr, std::span<const uint8_t> payload) {
-    if (hdr.length != 4) co_return fail_connection(
-        std::make_error_code(std::errc::message_size));
+    if (hdr.length != 4)
+      co_return fail_connection(std::make_error_code(std::errc::message_size));
 
     uint32_t increment = ((uint32_t(payload[0]) & 0x7f) << 24) |
                          (uint32_t(payload[1]) << 16) |
-                         (uint32_t(payload[2]) << 8) |
-                         uint32_t(payload[3]);
+                         (uint32_t(payload[2]) << 8) | uint32_t(payload[3]);
     if (increment == 0) {
       // RFC 7540 §6.9: increment 0 is connection error when stream_id == 0,
       // stream error (RST_STREAM) otherwise.
-      if (hdr.stream_id == 0) co_return fail_connection(
-          std::make_error_code(std::errc::protocol_error));
+      if (hdr.stream_id == 0)
+        co_return fail_connection(
+            std::make_error_code(std::errc::protocol_error));
       auto rst_st = find_stream(hdr.stream_id);
       if (rst_st) {
         rst_st->resp.net_err = std::make_error_code(std::errc::protocol_error);
@@ -1013,8 +1044,8 @@ class coro_http2_client {
     co_return true;
   }
 
-  async_simple::coro::Lazy<bool> on_priority(
-      const frame_header& hdr, std::span<const uint8_t> payload) {
+  async_simple::coro::Lazy<bool> on_priority(const frame_header& hdr,
+                                             std::span<const uint8_t> payload) {
     auto spec = parse_priority_payload(payload);
     if (hdr.stream_id == 0 || !spec.has_value() ||
         spec->stream_dependency == hdr.stream_id) {
@@ -1043,11 +1074,10 @@ class coro_http2_client {
       co_return false;
     }
 
-    uint32_t promised_stream_id =
-        ((uint32_t(parsed.payload[0]) & 0x7f) << 24) |
-        (uint32_t(parsed.payload[1]) << 16) |
-        (uint32_t(parsed.payload[2]) << 8) |
-        uint32_t(parsed.payload[3]);
+    uint32_t promised_stream_id = ((uint32_t(parsed.payload[0]) & 0x7f) << 24) |
+                                  (uint32_t(parsed.payload[1]) << 16) |
+                                  (uint32_t(parsed.payload[2]) << 8) |
+                                  uint32_t(parsed.payload[3]);
     if (promised_stream_id == 0 || (promised_stream_id & 1u) != 0 ||
         promised_stream_id <= last_promised_stream_id_) {
       fail_all_streams(std::make_error_code(std::errc::protocol_error));
@@ -1062,8 +1092,7 @@ class coro_http2_client {
     st->send_window = static_cast<int32_t>(peer_initial_window_size_);
     st->recv_window = static_cast<int32_t>(DEFAULT_WINDOW_SIZE);
     st->hdr_block_buf.insert(st->hdr_block_buf.end(),
-                             parsed.payload.begin() + 4,
-                             parsed.payload.end());
+                             parsed.payload.begin() + 4, parsed.payload.end());
     {
       std::scoped_lock lock(state_mutex_);
       streams_.emplace(promised_stream_id, st);
@@ -1085,14 +1114,15 @@ class coro_http2_client {
     co_return true;
   }
 
-  async_simple::coro::Lazy<bool> on_headers(
-      const frame_header& hdr, std::span<const uint8_t> payload) {
+  async_simple::coro::Lazy<bool> on_headers(const frame_header& hdr,
+                                            std::span<const uint8_t> payload) {
     if (hdr.stream_id == 0) {
       fail_all_streams(std::make_error_code(std::errc::protocol_error));
       co_return false;
     }
     auto st = find_stream(hdr.stream_id);
-    if (!st) co_return true;
+    if (!st)
+      co_return true;
 
     auto block_kind = st->final_response_received ? header_block_kind::trailer
                                                   : header_block_kind::initial;
@@ -1109,15 +1139,16 @@ class coro_http2_client {
       finish_stream(st);
       co_return true;
     }
-    st->hdr_block_buf.insert(
-        st->hdr_block_buf.end(), frag.payload.begin(), frag.payload.end());
+    st->hdr_block_buf.insert(st->hdr_block_buf.end(), frag.payload.begin(),
+                             frag.payload.end());
     if (hdr.flags & flags::END_HEADERS) {
       pending_continuation_ = {};
       auto decode_result = decode_headers(*st, block_kind);
       if (decode_result != header_decode_result::ok) {
         finish_stream(st);
-        co_return decode_result == header_decode_result::connection_error ? false
-                                                                          : true;
+        co_return decode_result == header_decode_result::connection_error
+            ? false
+            : true;
       }
       if (block_kind == header_block_kind::trailer) {
         st->trailing_headers_received = true;
@@ -1141,14 +1172,14 @@ class coro_http2_client {
       }
 
       st->final_response_received = true;
-      if ((hdr.flags & flags::END_STREAM) &&
-          st->content_length.has_value() &&
+      if ((hdr.flags & flags::END_STREAM) && st->content_length.has_value() &&
           *st->content_length != st->resp.body.size()) {
         st->resp.net_err = std::make_error_code(std::errc::protocol_error);
         finish_stream(st);
         co_return true;
       }
-      if (hdr.flags & flags::END_STREAM) finish_stream(st);
+      if (hdr.flags & flags::END_STREAM)
+        finish_stream(st);
     }
     else {
       pending_continuation_.stream_id = hdr.stream_id;
@@ -1163,7 +1194,8 @@ class coro_http2_client {
       const frame_header& hdr, std::span<const uint8_t> payload) {
     auto st = pending_continuation_.target;
     if (!st || hdr.stream_id != pending_continuation_.stream_id) {
-      co_return fail_connection(std::make_error_code(std::errc::protocol_error));
+      co_return fail_connection(
+          std::make_error_code(std::errc::protocol_error));
     }
     st->hdr_block_buf.insert(st->hdr_block_buf.end(), payload.begin(),
                              payload.end());
@@ -1171,19 +1203,20 @@ class coro_http2_client {
       auto block_kind = pending_continuation_.block_kind;
       bool is_push_promise = pending_continuation_.is_push_promise;
       pending_continuation_ = {};
-      auto decode_result = is_push_promise
-                               ? decode_push_request_headers(*st)
-                               : decode_headers(*st, block_kind);
+      auto decode_result = is_push_promise ? decode_push_request_headers(*st)
+                                           : decode_headers(*st, block_kind);
       if (decode_result != header_decode_result::ok) {
         if (is_push_promise) {
           fail_all_streams(std::make_error_code(std::errc::protocol_error));
           co_return decode_result != header_decode_result::connection_error;
         }
         finish_stream(st);
-        co_return decode_result == header_decode_result::connection_error ? false
-                                                                          : true;
+        co_return decode_result == header_decode_result::connection_error
+            ? false
+            : true;
       }
-      if (is_push_promise) co_return true;
+      if (is_push_promise)
+        co_return true;
       if (block_kind == header_block_kind::trailer) {
         st->trailing_headers_received = true;
         if (st->content_length.has_value() &&
@@ -1206,26 +1239,27 @@ class coro_http2_client {
       }
 
       st->final_response_received = true;
-      if ((hdr.flags & flags::END_STREAM) &&
-          st->content_length.has_value() &&
+      if ((hdr.flags & flags::END_STREAM) && st->content_length.has_value() &&
           *st->content_length != st->resp.body.size()) {
         st->resp.net_err = std::make_error_code(std::errc::protocol_error);
         finish_stream(st);
         co_return true;
       }
-      if (hdr.flags & flags::END_STREAM) finish_stream(st);
+      if (hdr.flags & flags::END_STREAM)
+        finish_stream(st);
     }
     co_return true;
   }
 
-  async_simple::coro::Lazy<bool> on_data(
-      const frame_header& hdr, std::span<const uint8_t> payload) {
+  async_simple::coro::Lazy<bool> on_data(const frame_header& hdr,
+                                         std::span<const uint8_t> payload) {
     if (hdr.stream_id == 0) {
       fail_all_streams(std::make_error_code(std::errc::protocol_error));
       co_return false;
     }
     auto st = find_stream(hdr.stream_id);
-    if (!st) co_return true;
+    if (!st)
+      co_return true;
 
     if (!st->final_response_received) {
       if (hdr.length != 0 || (hdr.flags & flags::END_STREAM)) {
@@ -1253,8 +1287,8 @@ class coro_http2_client {
       }
     }
 
-    st->resp.body.append(
-        reinterpret_cast<const char*>(data.payload.data()), data.payload.size());
+    st->resp.body.append(reinterpret_cast<const char*>(data.payload.data()),
+                         data.payload.size());
 
     // Flow control: decrement, accumulate pending, flush WINDOW_UPDATE when
     // half of the initial window has been consumed. Zero-length DATA does
@@ -1301,13 +1335,15 @@ class coro_http2_client {
     co_return true;
   }
 
-  async_simple::coro::Lazy<bool> on_ping(
-      const frame_header& hdr, std::span<const uint8_t> payload) {
-    if (hdr.stream_id != 0) co_return fail_connection(
-        std::make_error_code(std::errc::protocol_error));
-    if (payload.size() != 8) co_return fail_connection(
-        std::make_error_code(std::errc::message_size));
-    if (hdr.flags & flags::ACK) co_return true;
+  async_simple::coro::Lazy<bool> on_ping(const frame_header& hdr,
+                                         std::span<const uint8_t> payload) {
+    if (hdr.stream_id != 0)
+      co_return fail_connection(
+          std::make_error_code(std::errc::protocol_error));
+    if (payload.size() != 8)
+      co_return fail_connection(std::make_error_code(std::errc::message_size));
+    if (hdr.flags & flags::ACK)
+      co_return true;
 
     std::array<uint8_t, 8> data;
     std::copy_n(payload.begin(), 8, data.begin());
@@ -1316,28 +1352,30 @@ class coro_http2_client {
 
   async_simple::coro::Lazy<bool> on_rst_stream(
       const frame_header& hdr, std::span<const uint8_t> payload) {
-    if (hdr.stream_id == 0) co_return fail_connection(
-        std::make_error_code(std::errc::protocol_error));
-    if (payload.size() != 4) co_return fail_connection(
-        std::make_error_code(std::errc::message_size));
+    if (hdr.stream_id == 0)
+      co_return fail_connection(
+          std::make_error_code(std::errc::protocol_error));
+    if (payload.size() != 4)
+      co_return fail_connection(std::make_error_code(std::errc::message_size));
     auto st = find_stream(hdr.stream_id);
-    if (!st) co_return true;
+    if (!st)
+      co_return true;
 
     st->resp.net_err = std::make_error_code(std::errc::operation_canceled);
     finish_stream(st);
     co_return true;
   }
 
-  async_simple::coro::Lazy<bool> on_goaway(
-      const frame_header& hdr, std::span<const uint8_t> payload) {
-    if (hdr.stream_id != 0) co_return fail_connection(
-        std::make_error_code(std::errc::protocol_error));
-    if (payload.size() < 8) co_return fail_connection(
-        std::make_error_code(std::errc::message_size));
-    uint32_t last_stream_id = ((uint32_t(payload[0]) & 0x7f) << 24) |
-                              (uint32_t(payload[1]) << 16) |
-                              (uint32_t(payload[2]) << 8) |
-                              uint32_t(payload[3]);
+  async_simple::coro::Lazy<bool> on_goaway(const frame_header& hdr,
+                                           std::span<const uint8_t> payload) {
+    if (hdr.stream_id != 0)
+      co_return fail_connection(
+          std::make_error_code(std::errc::protocol_error));
+    if (payload.size() < 8)
+      co_return fail_connection(std::make_error_code(std::errc::message_size));
+    uint32_t last_stream_id =
+        ((uint32_t(payload[0]) & 0x7f) << 24) | (uint32_t(payload[1]) << 16) |
+        (uint32_t(payload[2]) << 8) | uint32_t(payload[3]);
     auto stream_start_lock = co_await stream_start_mutex_.coScopedLock();
     {
       auto stream_limit_lock = co_await stream_limit_mutex_.coScopedLock();
@@ -1360,8 +1398,7 @@ class coro_http2_client {
       return validate_response_headers(decoded, st, block_kind)
                  ? header_decode_result::ok
                  : header_decode_result::stream_error;
-    }
-    catch (...) {
+    } catch (...) {
       st.resp.net_err = std::make_error_code(std::errc::protocol_error);
       return header_decode_result::connection_error;
     }
@@ -1478,7 +1515,8 @@ class coro_http2_client {
   }
 
   void finish_stream(const std::shared_ptr<stream_state>& st) {
-    if (!st || st->done_signaled.exchange(true)) return;
+    if (!st || st->done_signaled.exchange(true))
+      return;
     send_window_cv_.notifyAll();
     if (st->is_pushed) {
       h2_pushed_response pushed{
@@ -1489,7 +1527,8 @@ class coro_http2_client {
         std::scoped_lock lock(state_mutex_);
         streams_.erase(st->stream_id);
       }
-      if (push_handler_) push_handler_(std::move(pushed));
+      if (push_handler_)
+        push_handler_(std::move(pushed));
       return;
     }
     st->promise.setValue(std::move(st->resp));
@@ -1530,7 +1569,8 @@ class coro_http2_client {
   }
 
   bool can_send_stream(uint32_t stream_id, const stream_state& st) const {
-    if (connection_closed_.load() || st.done_signaled.load()) return false;
+    if (connection_closed_.load() || st.done_signaled.load())
+      return false;
     return !going_away_.load() ||
            stream_id <= peer_goaway_last_stream_id_.load();
   }
@@ -1545,13 +1585,15 @@ class coro_http2_client {
   static bool has_header(const std::vector<header_field>& headers,
                          std::string_view name) {
     for (auto& hf : headers) {
-      if (hf.name == name) return true;
+      if (hf.name == name)
+        return true;
     }
     return false;
   }
 
   static std::optional<uint64_t> parse_content_length(std::string_view value) {
-    if (value.empty()) return std::nullopt;
+    if (value.empty())
+      return std::nullopt;
     uint64_t result = 0;
     auto* begin = value.data();
     auto* end = value.data() + value.size();
@@ -1618,8 +1660,7 @@ class coro_http2_client {
       return validate_push_request_headers(decoded, st)
                  ? header_decode_result::ok
                  : header_decode_result::stream_error;
-    }
-    catch (...) {
+    } catch (...) {
       st.resp.net_err = std::make_error_code(std::errc::protocol_error);
       return header_decode_result::connection_error;
     }
@@ -1647,22 +1688,26 @@ class coro_http2_client {
           return false;
         }
         if (hf.name == ":method") {
-          if (seen_method) return false;
+          if (seen_method)
+            return false;
           seen_method = true;
           st.req.method = hf.value;
         }
         else if (hf.name == ":path") {
-          if (seen_path) return false;
+          if (seen_path)
+            return false;
           seen_path = true;
           st.req.path = hf.value;
         }
         else if (hf.name == ":scheme") {
-          if (seen_scheme) return false;
+          if (seen_scheme)
+            return false;
           seen_scheme = true;
           st.req.scheme = hf.value;
         }
         else if (hf.name == ":authority") {
-          if (seen_authority) return false;
+          if (seen_authority)
+            return false;
           seen_authority = true;
           st.req.authority = hf.value;
         }
@@ -1674,8 +1719,8 @@ class coro_http2_client {
       }
 
       seen_regular = true;
-      if (!validate_request_regular_header(
-              hf.name, hf.value, header_block_kind::initial)) {
+      if (!validate_request_regular_header(hf.name, hf.value,
+                                           header_block_kind::initial)) {
         st.resp.net_err = std::make_error_code(std::errc::protocol_error);
         return false;
       }
@@ -1706,15 +1751,15 @@ class coro_http2_client {
 
 #ifdef CINATRA_ENABLE_SSL
   bool recreate_ssl_stream() {
-    if (!ssl_ctx_) return false;
-    ssl_stream_ =
-        std::make_unique<asio::ssl::stream<asio::ip::tcp::socket&>>(
-            socket_, *ssl_ctx_);
+    if (!ssl_ctx_)
+      return false;
+    ssl_stream_ = std::make_unique<asio::ssl::stream<asio::ip::tcp::socket&>>(
+        socket_, *ssl_ctx_);
     static constexpr unsigned char ALPN_H2_HTTP1[] = {
         2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
-    if (SSL_set_alpn_protos(
-            ssl_stream_->native_handle(), ALPN_H2_HTTP1,
-            static_cast<unsigned int>(sizeof(ALPN_H2_HTTP1))) != 0) {
+    if (SSL_set_alpn_protos(ssl_stream_->native_handle(), ALPN_H2_HTTP1,
+                            static_cast<unsigned int>(sizeof(ALPN_H2_HTTP1))) !=
+        0) {
       ssl_stream_.reset();
       return false;
     }
@@ -1727,66 +1772,60 @@ class coro_http2_client {
   }
 #endif
 
-  coro_io::ExecutorWrapper<>*                   executor_;
-  asio::ip::tcp::socket                         socket_;
-  std::condition_variable                       read_loop_cv_;
-  std::mutex                                    read_loop_mutex_;
-  bool                                          read_loop_running_ = false;
-  async_simple::coro::Mutex                     write_mutex_;
-  async_simple::coro::Mutex                     header_mutex_;
-  async_simple::coro::Mutex                     send_window_mutex_;
-  async_simple::coro::Mutex                     stream_limit_mutex_;
-  async_simple::coro::Mutex                     stream_start_mutex_;
-  async_simple::coro::ConditionVariable<
-      async_simple::coro::Mutex>                send_window_cv_;
-  async_simple::coro::ConditionVariable<
-      async_simple::coro::Mutex>                stream_limit_cv_;
-  std::mutex                                    state_mutex_;
-  hpack_decoder                                 decoder_;
-  hpack_encoder                                 encoder_;
+  coro_io::ExecutorWrapper<>* executor_;
+  asio::ip::tcp::socket socket_;
+  std::condition_variable read_loop_cv_;
+  std::mutex read_loop_mutex_;
+  bool read_loop_running_ = false;
+  async_simple::coro::Mutex write_mutex_;
+  async_simple::coro::Mutex header_mutex_;
+  async_simple::coro::Mutex send_window_mutex_;
+  async_simple::coro::Mutex stream_limit_mutex_;
+  async_simple::coro::Mutex stream_start_mutex_;
+  async_simple::coro::ConditionVariable<async_simple::coro::Mutex>
+      send_window_cv_;
+  async_simple::coro::ConditionVariable<async_simple::coro::Mutex>
+      stream_limit_cv_;
+  std::mutex state_mutex_;
+  hpack_decoder decoder_;
+  hpack_encoder encoder_;
   std::unordered_map<uint32_t, std::shared_ptr<stream_state>> streams_;
-  std::vector<uint8_t>                          payload_buf_;
-  continuation_state                            pending_continuation_;
-  std::string                                   host_;
-  std::string                                   port_;
-  std::string                                   scheme_ = "http";
-  std::string                                   authority_;
-  uint32_t                                      next_stream_id_ = 1;
-  uint32_t                                      last_promised_stream_id_ = 0;
-  uint32_t                                      peer_initial_window_size_ =
-      DEFAULT_WINDOW_SIZE;
-  uint32_t                                      peer_max_frame_size_ =
-      MAX_FRAME_SIZE;
-  uint32_t                                      peer_max_header_list_size_ =
+  std::vector<uint8_t> payload_buf_;
+  continuation_state pending_continuation_;
+  std::string host_;
+  std::string port_;
+  std::string scheme_ = "http";
+  std::string authority_;
+  uint32_t next_stream_id_ = 1;
+  uint32_t last_promised_stream_id_ = 0;
+  uint32_t peer_initial_window_size_ = DEFAULT_WINDOW_SIZE;
+  uint32_t peer_max_frame_size_ = MAX_FRAME_SIZE;
+  uint32_t peer_max_header_list_size_ = std::numeric_limits<uint32_t>::max();
+  std::atomic<uint32_t> peer_max_concurrent_streams_ =
       std::numeric_limits<uint32_t>::max();
-  std::atomic<uint32_t>                         peer_max_concurrent_streams_ =
+  bool peer_enable_connect_protocol_ = false;
+  std::atomic<bool> peer_settings_ready_ = false;
+  std::atomic<uint32_t> peer_goaway_last_stream_id_ =
       std::numeric_limits<uint32_t>::max();
-  bool                                          peer_enable_connect_protocol_ =
-      false;
-  std::atomic<bool>                             peer_settings_ready_ = false;
-  std::atomic<uint32_t>                         peer_goaway_last_stream_id_ =
-      std::numeric_limits<uint32_t>::max();
-  int32_t                                       connection_send_window_ =
-      static_cast<int32_t>(DEFAULT_WINDOW_SIZE);
-  int32_t                                       connection_recv_window_ =
-      static_cast<int32_t>(DEFAULT_WINDOW_SIZE);
-  uint32_t                                      connection_recv_pending_ = 0;
-  std::atomic<uint32_t>                         active_stream_count_ = 0;
-  std::atomic<bool>                             connection_closed_ = false;
-  std::atomic<bool>                             connected_ = false;
-  std::atomic<bool>                             going_away_ = false;
-  std::atomic<uint64_t>                         request_start_next_ticket_ = 0;
-  std::atomic<uint64_t>                         request_start_turn_ = 0;
-  std::optional<std::error_code>                pending_connection_error_;
-  bool                                          enable_push_ = false;
-  bool                                          use_h2c_upgrade_ = false;
-  std::function<void(h2_pushed_response)>       push_handler_;
+  int32_t connection_send_window_ = static_cast<int32_t>(DEFAULT_WINDOW_SIZE);
+  int32_t connection_recv_window_ = static_cast<int32_t>(DEFAULT_WINDOW_SIZE);
+  uint32_t connection_recv_pending_ = 0;
+  std::atomic<uint32_t> active_stream_count_ = 0;
+  std::atomic<bool> connection_closed_ = false;
+  std::atomic<bool> connected_ = false;
+  std::atomic<bool> going_away_ = false;
+  std::atomic<uint64_t> request_start_next_ticket_ = 0;
+  std::atomic<uint64_t> request_start_turn_ = 0;
+  std::optional<std::error_code> pending_connection_error_;
+  bool enable_push_ = false;
+  bool use_h2c_upgrade_ = false;
+  std::function<void(h2_pushed_response)> push_handler_;
 #ifdef CINATRA_ENABLE_SSL
-  std::unique_ptr<asio::ssl::context>           ssl_ctx_ = nullptr;
+  std::unique_ptr<asio::ssl::context> ssl_ctx_ = nullptr;
   std::unique_ptr<asio::ssl::stream<asio::ip::tcp::socket&>> ssl_stream_;
-  std::string                                   ssl_sni_hostname_;
-  bool                                          has_init_ssl_ = false;
-  bool                                          use_ssl_ = false;
+  std::string ssl_sni_hostname_;
+  bool has_init_ssl_ = false;
+  bool use_ssl_ = false;
 #endif
 };
 
