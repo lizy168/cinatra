@@ -27,9 +27,8 @@ TEST_CASE("token bucket limiter basic") {
   limiter2.wait();  // Second needs to wait about 1 second
   auto duration = std::chrono::steady_clock::now() - start;
 
-  CHECK(duration >= 900ms);  // Should wait at least 0.9 seconds
-  // Keep the upper bound loose: CI runners can be descheduled for seconds.
-  CHECK(duration <= 10s);
+  CHECK(duration >= 900ms);   // Should wait at least 0.9 seconds
+  CHECK(duration <= 1500ms);  // Only second wait blocks (~1s total)
 }
 
 async_simple::coro::Lazy<void> test_async_limiter() {
@@ -41,7 +40,7 @@ async_simple::coro::Lazy<void> test_async_limiter() {
   auto duration = std::chrono::steady_clock::now() - start;
 
   CHECK(duration >= 900ms);
-  CHECK(duration <= 10s);
+  CHECK(duration <= 1500ms);  // Only second wait blocks (~1s total)
 }
 
 TEST_CASE("token bucket limiter async") {
@@ -75,7 +74,7 @@ TEST_CASE("wait_n_tokens") {
 
   auto duration = std::chrono::steady_clock::now() - start;
   CHECK(duration >= 1400ms);
-  CHECK(duration <= 10s);
+  CHECK(duration <= 2500ms);
 }
 
 async_simple::coro::Lazy<void> test_wait_async_n() {
@@ -88,7 +87,7 @@ async_simple::coro::Lazy<void> test_wait_async_n() {
 
   auto duration = std::chrono::steady_clock::now() - start;
   CHECK(duration >= 1400ms);
-  CHECK(duration <= 10s);
+  CHECK(duration <= 2500ms);
 }
 
 TEST_CASE("wait_async_n") {
