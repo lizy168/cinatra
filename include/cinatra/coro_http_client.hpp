@@ -85,6 +85,31 @@ struct is_smart_ptr<
 template <class T>
 constexpr bool is_stream_ptr_v = is_smart_ptr<T>::value || std::is_pointer_v<T>;
 
+template <typename Handler>
+struct sse_event_handler {
+  Handler *handler;
+};
+
+template <typename T>
+struct is_sse_event_handler : std::false_type {};
+
+template <typename Handler>
+struct is_sse_event_handler<sse_event_handler<Handler>> : std::true_type {};
+
+template <typename T>
+constexpr bool is_sse_event_handler_v =
+    is_sse_event_handler<std::remove_cvref_t<T>>::value;
+
+template <typename BodyTarget>
+auto make_body_target(BodyTarget &&out_buf) {
+  if constexpr (is_sse_event_handler_v<BodyTarget>) {
+    return std::remove_cvref_t<BodyTarget>{out_buf};
+  }
+  else {
+    return std::span<char>{out_buf.data(), out_buf.size()};
+  }
+}
+
 struct http_header;
 
 struct resp_data {
@@ -165,7 +190,7 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
       set_max_single_part_size(conf.max_single_part_size);
     }
     if (!conf.proxy_host.empty()) {
-      set_proxy_basic_auth(conf.proxy_host, conf.proxy_port);
+      set_proxy(conf.proxy_host, conf.proxy_port);
     }
     if (!conf.proxy_auth_username.empty()) {
       set_proxy_basic_auth(conf.proxy_auth_username, conf.proxy_auth_passwd);
@@ -596,6 +621,37 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
                          std::move(headers));
   }
 
+  template <typename Handler>
+  async_simple::coro::Lazy<resp_data> async_get_sse(
+      std::string uri, Handler handler,
+      std::unordered_map<std::string, std::string> headers = {}) {
+    req_context<> ctx{};
+    auto data = co_await async_sse_request(std::move(uri), http_method::GET,
+                                           std::move(ctx), handler, headers);
+    if (redirect_uri_.empty() || !is_redirect(data)) {
+      co_return data;
+    }
+
+    if (enable_follow_redirect_) {
+      req_context<> redirect_ctx{};
+      data = co_await async_sse_request(
+          std::move(redirect_uri_), http_method::GET, std::move(redirect_ctx),
+          handler, std::move(headers));
+    }
+    co_return data;
+  }
+
+  template <typename Handler>
+  async_simple::coro::Lazy<resp_data> async_post_sse(
+      std::string uri, std::string content, req_content_type content_type,
+      Handler handler,
+      std::unordered_map<std::string, std::string> headers = {}) {
+    req_context<> ctx{content_type, "", std::move(content)};
+    co_return co_await async_sse_request(std::move(uri), http_method::POST,
+                                         std::move(ctx), handler,
+                                         std::move(headers));
+  }
+
   async_simple::coro::Lazy<resp_data> async_put(
       std::string uri, std::string content, req_content_type content_type,
       std::unordered_map<std::string, std::string> headers = {}) {
@@ -642,7 +698,7 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
         : self(self), dur_(duration) {
       self->socket_->is_timeout_ = false;
 
-      if (duration.count() >= 0) {
+      if (duration.count() > 0) {
         self->timeout(self->timer_, duration, std::move(msg))
             .start([](auto &&) {
             });
@@ -651,8 +707,10 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
     }
     ~timer_guard() {
       if (dur_.count() > 0 && self->socket_->is_timeout_ == false) {
-        std::error_code ignore_ec;
-        self->timer_.cancel(ignore_ec);
+        try {
+          self->timer_.cancel();
+        } catch (...) {
+        }
       }
     }
     coro_http_client *self;
@@ -1111,6 +1169,11 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
     }
   }
 
+  static bool is_local_upload_source_error(const std::error_code &ec) {
+    return ec == std::make_error_code(std::errc::invalid_argument) ||
+           ec == std::make_error_code(std::errc::bad_file_descriptor);
+  }
+
   template <upload_type_t upload_type, typename S, typename Source>
   async_simple::coro::Lazy<resp_data> async_upload_impl(
       S uri, http_method method, Source source /* file */,
@@ -1230,8 +1293,23 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
       }
     }
     if (ec) {
-      handle_upload_timeout_error(ec);
-      co_return resp_data{ec, 404};
+      if (is_local_upload_source_error(ec)) {
+        close_socket(*socket_);
+        co_return resp_data{ec, 404};
+      }
+
+      // Body send failed; server may have already sent an early response
+      // (e.g. 503 or 413) before closing the connection.  Try to read it.
+      auto write_ec = ec;
+      ec = {};
+      data = co_await handle_read(ec, size, is_keep_alive, std::move(ctx),
+                                  http_method::POST);
+      if (ec || data.status == 0) {
+        handle_upload_timeout_error(write_ec);
+        co_return resp_data{write_ec, 404};
+      }
+      handle_result(data, ec, is_keep_alive);
+      co_return data;
     }
 
     data = co_await handle_read(ec, size, is_keep_alive, std::move(ctx),
@@ -1268,6 +1346,35 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
         std::move(headers));
   }
 
+  template <typename S>
+  async_simple::coro::Lazy<resp_data> async_request_chunked(
+      S uri, http_method method, std::string content,
+      req_content_type content_type = req_content_type::text,
+      std::unordered_map<std::string, std::string> headers = {}) {
+    auto source =
+        [content = std::move(content),
+         sent = false]() mutable -> async_simple::coro::Lazy<read_result> {
+      if (sent) {
+        co_return read_result{{}, true, {}};
+      }
+      sent = true;
+      co_return read_result{{content.data(), content.size()}, true, {}};
+    };
+
+    return async_upload_impl<upload_type_t::chunked>(
+        std::move(uri), method, std::move(source), content_type,
+        std::move(headers));
+  }
+
+  async_simple::coro::Lazy<resp_data> async_post_chunked(
+      std::string uri, std::string content,
+      req_content_type content_type = req_content_type::text,
+      std::unordered_map<std::string, std::string> headers = {}) {
+    return async_request_chunked(std::move(uri), http_method::POST,
+                                 std::move(content), content_type,
+                                 std::move(headers));
+  }
+
   // send multipart data, should call add_file_part or add_str_part firstly.
   async_simple::coro::Lazy<resp_data> async_upload_multipart(std::string uri) {
     if (form_data_.empty()) {
@@ -1291,11 +1398,21 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
     co_return co_await async_upload_multipart(std::move(uri));
   }
 
-  template <typename S, typename String>
+  template <typename S, typename String, typename BodyTarget = std::span<char>>
   async_simple::coro::Lazy<resp_data> async_request(
       S uri, http_method method, req_context<String> ctx,
       std::unordered_map<std::string, std::string> headers = {},
-      std::span<char> out_buf = {}) {
+      BodyTarget &&out_buf = {}) {
+    return async_request_impl(
+        std::move(uri), method, std::move(ctx), std::move(headers),
+        make_body_target(std::forward<BodyTarget>(out_buf)));
+  }
+
+  template <typename S, typename String, typename BodyTarget>
+  async_simple::coro::Lazy<resp_data> async_request_impl(
+      S uri, http_method method, req_context<String> ctx,
+      std::unordered_map<std::string, std::string> headers,
+      BodyTarget out_buf) {
     if (!resp_chunk_str_.empty()) {
       resp_chunk_str_.clear();
     }
@@ -1303,7 +1420,12 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
       body_.clear();
     }
 
-    out_buf_ = out_buf;
+    if constexpr (is_sse_event_handler_v<BodyTarget>) {
+      out_buf_ = {};
+    }
+    else {
+      out_buf_ = {out_buf.data(), out_buf.size()};
+    }
 
     std::shared_ptr<int> guard(nullptr, [this](auto) {
       if (!req_headers_.empty()) {
@@ -1360,6 +1482,8 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
       }
       else {
         u.path = uri;
+        u.host = host_;
+        u.port = port_;
       }
       if (socket_->has_closed_) {
         data = co_await connect(u);
@@ -1391,13 +1515,44 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
       if (ec) {
         break;
       }
-      data =
-          co_await handle_read(ec, size, is_keep_alive, std::move(ctx), method);
+      if constexpr (is_sse_event_handler_v<BodyTarget>) {
+        data = co_await handle_read(ec, size, is_keep_alive, std::move(ctx),
+                                    method, out_buf);
+      }
+      else {
+        data = co_await handle_read(ec, size, is_keep_alive, std::move(ctx),
+                                    method);
+      }
     } while (0);
     if (ec && socket_->is_timeout_) {
       ec = std::make_error_code(std::errc::timed_out);
     }
+    if constexpr (is_sse_event_handler_v<BodyTarget>) {
+      if (ec == std::errc::operation_canceled) {
+        ec = {};
+        is_keep_alive = false;
+      }
+    }
     handle_result(data, ec, is_keep_alive);
+    co_return data;
+  }
+
+  template <typename S, typename String, typename Handler>
+  async_simple::coro::Lazy<resp_data> async_sse_request(
+      S uri, http_method method, req_context<String> ctx, Handler &handler,
+      std::unordered_map<std::string, std::string> headers = {}) {
+    if (headers.empty()) {
+      if (req_headers_.find("Accept") == req_headers_.end()) {
+        req_headers_["Accept"] = "text/event-stream";
+      }
+    }
+    else if (headers.find("Accept") == headers.end()) {
+      headers["Accept"] = "text/event-stream";
+    }
+
+    auto data = co_await async_request(std::move(uri), method, std::move(ctx),
+                                       std::move(headers),
+                                       sse_event_handler<Handler>{&handler});
     co_return data;
   }
 
@@ -1649,15 +1804,16 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
 
   void construct_proxy_uri(uri_t &u) {
     if (!proxy_host_.empty() && !proxy_port_.empty()) {
+      // For HTTPS, a CONNECT tunnel is used; the request goes directly to the
+      // upstream server after the tunnel is established, so do not rewrite the
+      // request URI to absolute-form.
+      if (u.is_ssl) {
+        return;
+      }
       if (!proxy_request_uri_.empty())
         proxy_request_uri_.clear();
       if (u.get_port() == "80") {
         proxy_request_uri_.append("http://").append(u.get_host()).append(":80");
-      }
-      else if (u.get_port() == "443") {
-        proxy_request_uri_.append("https://")
-            .append(u.get_host())
-            .append(":443");
       }
       else {
         // all be http
@@ -1684,21 +1840,18 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
 
     if (!headers.empty()) {
       req_headers_ = std::move(headers);
-      req_str.append(" HTTP/1.1\r\n");
     }
-    else {
-      if (req_headers_.find("Host") == req_headers_.end()) {
-        req_str.append(" HTTP/1.1\r\nHost:").append(u.host);
-        if (u.port.empty()) {
-          req_str.append("\r\n");
-        }
-        else {
-          req_str.append(":").append(u.port).append("\r\n");
-        }
+    if (req_headers_.find("Host") == req_headers_.end()) {
+      req_str.append(" HTTP/1.1\r\nHost:").append(u.host);
+      if (u.port.empty()) {
+        req_str.append("\r\n");
       }
       else {
-        req_str.append(" HTTP/1.1\r\n");
+        req_str.append(":").append(u.port).append("\r\n");
       }
+    }
+    else {
+      req_str.append(" HTTP/1.1\r\n");
     }
 
     auto type_str = get_content_type_str(ctx.content_type);
@@ -1706,7 +1859,10 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
       if (ctx.content_type == req_content_type::multipart) {
         type_str.append(BOUNDARY);
       }
-      req_headers_["Content-Type"] = std::move(type_str);
+      // Only set if the user has not already provided a Content-Type header.
+      if (req_headers_.find("Content-Type") == req_headers_.end()) {
+        req_headers_["Content-Type"] = std::move(type_str);
+      }
     }
 
     bool has_connection = false;
@@ -1727,19 +1883,24 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
       req_str.append("Connection: keep-alive\r\n");
     }
 
-    if (!proxy_basic_auth_username_.empty() &&
-        !proxy_basic_auth_password_.empty()) {
-      std::string basic_auth_str = "Proxy-Authorization: Basic ";
-      std::string basic_base64_str = base64_encode(
-          proxy_basic_auth_username_ + ":" + proxy_basic_auth_password_);
-      req_str.append(basic_auth_str).append(basic_base64_str).append(CRCF);
-    }
+    // For HTTPS proxying, Proxy-Authorization is already sent in the CONNECT
+    // request.  After the tunnel is established the request goes directly to
+    // the upstream server, so it must not carry proxy credentials.
+    if (!u.is_ssl) {
+      if (!proxy_basic_auth_username_.empty() &&
+          !proxy_basic_auth_password_.empty()) {
+        std::string basic_auth_str = "Proxy-Authorization: Basic ";
+        std::string basic_base64_str = base64_encode(
+            proxy_basic_auth_username_ + ":" + proxy_basic_auth_password_);
+        req_str.append(basic_auth_str).append(basic_base64_str).append(CRCF);
+      }
 
-    if (!proxy_bearer_token_auth_token_.empty()) {
-      std::string bearer_token_str = "Proxy-Authorization: Bearer ";
-      req_str.append(bearer_token_str)
-          .append(proxy_bearer_token_auth_token_)
-          .append(CRCF);
+      if (!proxy_bearer_token_auth_token_.empty()) {
+        std::string bearer_token_str = "Proxy-Authorization: Bearer ";
+        req_str.append(bearer_token_str)
+            .append(proxy_bearer_token_auth_token_)
+            .append(CRCF);
+      }
     }
 
     if (!ctx.req_header.empty())
@@ -1806,12 +1967,10 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
     return {};
   }
 
-  template <typename String>
-  async_simple::coro::Lazy<resp_data> handle_read(std::error_code &ec,
-                                                  size_t &size,
-                                                  bool &is_keep_alive,
-                                                  req_context<String> ctx,
-                                                  http_method method) {
+  template <typename String, typename BodyTarget = std::span<char>>
+  async_simple::coro::Lazy<resp_data> handle_read(
+      std::error_code &ec, size_t &size, bool &is_keep_alive,
+      req_context<String> ctx, http_method method, BodyTarget out_buf = {}) {
     resp_data data{};
     do {
       if (std::tie(ec, size) = co_await async_read_until(head_buf_, TWO_CRCF);
@@ -1829,6 +1988,14 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
         co_return data;
       }
 
+      if constexpr (is_sse_event_handler_v<BodyTarget>) {
+        auto content_type = parser_.get_header_value("Content-Type");
+        if (content_type.find("text/event-stream") == std::string_view::npos) {
+          ec = std::make_error_code(std::errc::protocol_error);
+          break;
+        }
+      }
+
       bool is_out_buf = false;
 
       bool is_ranges = parser_.is_resp_ranges();
@@ -1844,7 +2011,12 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
           chunked_buf_.sputn(data_ptr, head_buf_.size());
           head_buf_.consume(head_buf_.size());
         }
-        ec = co_await handle_chunked(data, std::move(ctx));
+        ec = co_await handle_chunked(data, std::move(ctx), out_buf);
+        break;
+      }
+
+      if constexpr (is_sse_event_handler_v<BodyTarget>) {
+        ec = std::make_error_code(std::errc::protocol_error);
         break;
       }
 
@@ -1916,16 +2088,21 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
       size_t part_size = head_buf_.size();
       size_t size_to_read = content_len - part_size;
 
-      auto data_ptr = asio::buffer_cast<const char *>(head_buf_.data());
       if (is_out_buf) {
-        memcpy(out_buf_.data(), data_ptr, part_size);
+        if (part_size > 0) {
+          memcpy(out_buf_.data(),
+                 asio::buffer_cast<const char *>(head_buf_.data()), part_size);
+          head_buf_.consume(part_size);
+        }
       }
       else {
         detail::resize(body_, content_len);
-        memcpy(body_.data(), data_ptr, part_size);
+        if (part_size > 0) {
+          memcpy(body_.data(),
+                 asio::buffer_cast<const char *>(head_buf_.data()), part_size);
+          head_buf_.consume(part_size);
+        }
       }
-
-      head_buf_.consume(part_size);
 
       if (is_out_buf) {
         if (std::tie(ec, size) = co_await async_read(
@@ -1948,7 +2125,10 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
       co_await handle_entire_content(data, content_len, is_ranges, ctx);
     } while (0);
 
-    if (!resp_chunk_str_.empty()) {
+    if constexpr (is_sse_event_handler_v<BodyTarget>) {
+      resp_chunk_str_.clear();
+    }
+    else if (!resp_chunk_str_.empty()) {
       data.resp_body =
           std::string_view{resp_chunk_str_.data(), resp_chunk_str_.size()};
     }
@@ -2082,9 +2262,9 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
     co_return ec;
   }
 
-  template <typename String>
+  template <typename String, typename BodyTarget = std::span<char>>
   async_simple::coro::Lazy<std::error_code> handle_chunked(
-      resp_data &data, req_context<String> ctx) {
+      resp_data &data, req_context<String> ctx, BodyTarget out_buf = {}) {
     std::error_code ec{};
     size_t size = 0;
     while (true) {
@@ -2098,6 +2278,10 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
       const char *data_ptr =
           asio::buffer_cast<const char *>(chunked_buf_.data());
       std::string_view size_str(data_ptr, size - CRCF.size());
+      if (auto pos = size_str.find(';'); pos != std::string_view::npos) {
+        size_str = size_str.substr(0, pos);
+      }
+      size_str = trim_sv(size_str);
       auto chunk_size = hex_to_int(size_str);
       chunked_buf_.consume(size);
       if (chunk_size < 0) {
@@ -2119,23 +2303,181 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
 
       if (chunk_size == 0) {
         // all finished, no more data
-        chunked_buf_.consume(chunked_buf_.size());
+        if (std::tie(ec, size) = co_await async_read_until(chunked_buf_, CRCF);
+            ec) {
+          break;
+        }
+        while (size != CRCF.size()) {
+          chunked_buf_.consume(size);
+          if (std::tie(ec, size) =
+                  co_await async_read_until(chunked_buf_, CRCF);
+              ec) {
+            break;
+          }
+        }
+        if (ec) {
+          break;
+        }
+        chunked_buf_.consume(size);
         data.eof = true;
+        if constexpr (is_sse_event_handler_v<BodyTarget>) {
+          ec = parse_sse_events({}, *out_buf.handler, true);
+        }
         break;
       }
 
       data_ptr = asio::buffer_cast<const char *>(chunked_buf_.data());
-      if (ctx.resp_body_stream) {
-        std::tie(ec, size) = co_await ctx.resp_body_stream->async_write(
-            {data_ptr, (size_t)chunk_size});
+      if constexpr (is_sse_event_handler_v<BodyTarget>) {
+        ec = parse_sse_events({data_ptr, (size_t)chunk_size}, *out_buf.handler,
+                              false);
       }
       else {
-        resp_chunk_str_.append(data_ptr, chunk_size);
+        if (ctx.resp_body_stream) {
+          std::tie(ec, size) = co_await ctx.resp_body_stream->async_write(
+              {data_ptr, (size_t)chunk_size});
+        }
+        else {
+          resp_chunk_str_.append(data_ptr, chunk_size);
+        }
       }
 
       chunked_buf_.consume(chunk_size + CRCF.size());
+      if (ec) {
+        break;
+      }
     }
     co_return ec;
+  }
+
+  template <typename Handler>
+  std::error_code parse_sse_events(std::string_view chunk, Handler &handler,
+                                   bool flush) {
+    if (!chunk.empty()) {
+      resp_chunk_str_.append(chunk.data(), chunk.size());
+    }
+
+    while (true) {
+      size_t event_end = std::string::npos;
+      size_t event_next = std::string::npos;
+      size_t line_start = 0;
+      while (line_start < resp_chunk_str_.size()) {
+        size_t line_end = resp_chunk_str_.find_first_of("\r\n", line_start);
+        if (line_end == std::string::npos) {
+          break;
+        }
+
+        size_t next = line_end + 1;
+        if (resp_chunk_str_[line_end] == '\r' &&
+            next < resp_chunk_str_.size() && resp_chunk_str_[next] == '\n') {
+          next++;
+        }
+
+        if (line_end == line_start) {
+          event_end = line_start;
+          event_next = next;
+          break;
+        }
+        line_start = next;
+      }
+
+      if (event_end == std::string::npos) {
+        if (flush) {
+          resp_chunk_str_.clear();
+        }
+        break;
+      }
+
+      auto ec = dispatch_sse_event(
+          std::string_view{resp_chunk_str_.data(), event_end}, handler);
+      resp_chunk_str_.erase(0, event_next);
+      if (ec) {
+        return ec;
+      }
+    }
+
+    return {};
+  }
+
+  template <typename Handler>
+  std::error_code dispatch_sse_event(std::string_view raw, Handler &handler) {
+    if (raw.size() >= 3 && (unsigned char)raw[0] == 0xef &&
+        (unsigned char)raw[1] == 0xbb && (unsigned char)raw[2] == 0xbf) {
+      raw.remove_prefix(3);
+    }
+
+    sse_event event;
+    bool has_data = false;
+    size_t start = 0;
+    while (start < raw.size()) {
+      size_t end = raw.find_first_of("\r\n", start);
+      auto line =
+          raw.substr(start, end == std::string_view::npos ? raw.size() - start
+                                                          : end - start);
+
+      if (!line.empty() && line.front() != ':') {
+        auto colon = line.find(':');
+        auto key = line.substr(0, colon);
+        auto value = colon == std::string_view::npos ? std::string_view{}
+                                                     : line.substr(colon + 1);
+        if (!value.empty() && value.front() == ' ') {
+          value.remove_prefix(1);
+        }
+
+        if (key == "event") {
+          event.event.assign(value);
+        }
+        else if (key == "data") {
+          if (!event.data.empty()) {
+            event.data.push_back('\n');
+          }
+          event.data.append(value);
+          has_data = true;
+        }
+        else if (key == "id") {
+          if (value.find('\0') == std::string_view::npos) {
+            event.id.assign(value);
+          }
+        }
+        else if (key == "retry") {
+          int64_t retry = 0;
+          auto [ptr, conv_ec] =
+              std::from_chars(value.data(), value.data() + value.size(), retry);
+          if (conv_ec == std::errc{} && ptr == value.data() + value.size() &&
+              retry >= 0) {
+            event.retry = retry;
+          }
+        }
+      }
+
+      if (end == std::string_view::npos) {
+        break;
+      }
+      start = end + 1;
+      if (raw[end] == '\r' && start < raw.size() && raw[start] == '\n') {
+        start++;
+      }
+    }
+
+    if (!has_data) {
+      return {};
+    }
+
+    if constexpr (std::is_same_v<
+                      std::invoke_result_t<Handler &, const sse_event &>,
+                      std::error_code>) {
+      return handler(event);
+    }
+    else if constexpr (std::is_same_v<
+                           std::invoke_result_t<Handler &, const sse_event &>,
+                           bool>) {
+      return handler(event)
+                 ? std::error_code{}
+                 : std::make_error_code(std::errc::operation_canceled);
+    }
+    else {
+      handler(event);
+      return {};
+    }
   }
 
   async_simple::coro::Lazy<resp_data> connect(const uri_t &u) {
@@ -2168,6 +2510,56 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
       }
 
       if (u.is_ssl) {
+        if (!proxy_host_.empty()) {
+          // Establish a CONNECT tunnel through the HTTP proxy before the SSL
+          // handshake so that the proxy forwards the encrypted stream.
+          std::string target_host = u.get_host();
+          std::string target_port = u.get_port();
+          std::string connect_req;
+          connect_req.append("CONNECT ")
+              .append(target_host)
+              .append(":")
+              .append(target_port)
+              .append(" HTTP/1.1\r\nHost: ")
+              .append(target_host)
+              .append(":")
+              .append(target_port);
+          if (!proxy_basic_auth_username_.empty() &&
+              !proxy_basic_auth_password_.empty()) {
+            connect_req.append("\r\nProxy-Authorization: Basic ")
+                .append(base64_encode(proxy_basic_auth_username_ + ":" +
+                                      proxy_basic_auth_password_));
+          }
+          if (!proxy_bearer_token_auth_token_.empty()) {
+            connect_req.append("\r\nProxy-Authorization: Bearer ")
+                .append(proxy_bearer_token_auth_token_);
+          }
+          connect_req.append("\r\n\r\n");
+
+          if (auto [ec, _] = co_await coro_io::async_write(
+                  socket_->impl_, asio::buffer(connect_req));
+              ec) {
+            co_return resp_data{ec, 404};
+          }
+
+          // Read proxy response until end of headers
+          if (auto [ec, _] = co_await coro_io::async_read_until(
+                  socket_->impl_, head_buf_, "\r\n\r\n");
+              ec) {
+            co_return resp_data{ec, 404};
+          }
+
+          auto buf_data = asio::buffer_cast<const char *>(head_buf_.data());
+          std::string_view resp_view(buf_data, head_buf_.size());
+          // Check the status line (first line) for "200".
+          auto first_line = resp_view.substr(0, resp_view.find("\r\n"));
+          if (first_line.find(" 200") == std::string_view::npos) {
+            co_return resp_data{
+                std::make_error_code(std::errc::connection_refused), 407};
+          }
+          head_buf_.consume(head_buf_.size());
+        }
+
 #ifdef CINATRA_ENABLE_SSL
         if (!has_init_ssl_) {
           size_t pos = u.host.find("www.");

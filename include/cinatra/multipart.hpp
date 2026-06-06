@@ -57,10 +57,10 @@ class multipart_reader_t {
         break;
       }
 
-      if (size_t pos = data.find("name"); pos != std::string_view::npos) {
+      if (size_t pos = data.find(name); pos != std::string_view::npos) {
         result.name = get_part_name(data, name, pos);
 
-        if (size_t pos = data.find("filename"); pos != std::string_view::npos) {
+        if (size_t pos = data.find(filename); pos != std::string_view::npos) {
           result.filename = get_part_name(data, filename, pos);
         }
         continue;
@@ -104,6 +104,9 @@ class multipart_reader_t {
       constexpr std::string_view complete_flag = "--\r\n";
       if (data == complete_flag) {
         result.eof = true;
+        if constexpr (requires { conn_->multipart_body_finished_; }) {
+          conn_->multipart_body_finished_ = true;
+        }
       }
     }
 

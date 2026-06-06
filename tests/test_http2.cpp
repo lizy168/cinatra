@@ -1478,7 +1478,7 @@ TEST_CASE("preface: client magic not followed by SETTINGS triggers GOAWAY") {
 // client connecting before the async accept is posted.
 static void connect_with_retry(asio::ip::tcp::socket& sock, uint16_t port,
                                int retries) {
-  asio::ip::tcp::endpoint ep(asio::ip::address::from_string("127.0.0.1"), port);
+  asio::ip::tcp::endpoint ep(asio::ip::make_address("127.0.0.1"), port);
   for (int i = 0; i < retries; ++i) {
     std::error_code ec;
     sock.connect(ep, ec);
@@ -1494,7 +1494,7 @@ static void connect_with_retry(asio::ip::tcp::socket& sock, uint16_t port,
 
 static void connect_direct(asio::ip::tcp::socket& sock, uint16_t port) {
   sock.connect(asio::ip::tcp::endpoint(
-      asio::ip::address::from_string("127.0.0.1"), port));
+      asio::ip::make_address("127.0.0.1"), port));
   set_test_socket_timeouts(sock);
 }
 

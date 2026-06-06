@@ -43,6 +43,8 @@ class coro_http_connection
       : executor_(executor),
         socket_(std::move(socket)),
         router_(router),
+        max_http_header_size_(8 * 1024),
+        head_buf_(max_http_header_size_),
         request_(parser_, this),
         response_(this) {
     buffers_.reserve(3);
@@ -111,6 +113,8 @@ class coro_http_connection
 #endif
     std::chrono::system_clock::time_point start{};
     std::chrono::system_clock::time_point mid{};
+    std::destroy_at(&head_buf_);
+    new (&head_buf_) asio::streambuf(max_http_header_size_);
     while (true) {
 #ifdef CINATRA_ENABLE_SSL
       if (use_ssl_ && !has_shake) {
@@ -137,11 +141,20 @@ class coro_http_connection
       }
 #endif
       auto [ec, size] = co_await async_read_until(head_buf_, TWO_CRCF);
+      if (ec == asio::error::not_found) {
+        CINATRA_LOG_WARNING << "http header too large (> "
+                            << max_http_header_size_ << " bytes)";
+        response_.set_status_and_content(
+            status_type::request_header_fields_too_large,
+            "request header too large");
+        co_await reply();
+        close();
+        break;
+      }
       if (ec) {
         if (ec != asio::error::eof) {
           CINATRA_LOG_WARNING << "read http header error: " << ec.message();
         }
-
         close();
         break;
       }
@@ -416,6 +429,10 @@ class coro_http_connection
         }
       }
 
+      if (type == content_type::multipart && !multipart_body_finished_) {
+        keep_alive_ = false;
+      }
+
       if (!keep_alive_) {
         // now in io thread, so can close socket immediately.
         close();
@@ -426,6 +443,7 @@ class coro_http_connection
       buffers_.clear();
       body_.clear();
       resp_str_.clear();
+      multipart_body_finished_ = false;
       multi_buf_ = true;
       if (need_shrink_every_time_) {
         body_.shrink_to_fit();
@@ -493,6 +511,10 @@ class coro_http_connection
     max_http_body_len_ = max_size;
   }
 
+  void set_max_http_header_size(size_t max_size) {
+    max_http_header_size_ = max_size;
+  }
+
 #ifdef INJECT_FOR_HTTP_SEVER_TEST
   void set_write_failed_forever(bool r) { write_failed_forever_ = r; }
 
@@ -529,6 +551,33 @@ class coro_http_connection
   async_simple::coro::Lazy<bool> end_chunked() {
     co_return co_await write_chunked("", true);
   }
+
+  async_simple::coro::Lazy<bool> begin_sse() {
+    response_.set_format_type(format_type::chunked);
+    response_.add_header("Content-Type", "text/event-stream");
+    response_.add_header("Cache-Control", "no-cache");
+    response_.add_header("Connection", "keep-alive");
+    co_return co_await begin_chunked();
+  }
+
+  async_simple::coro::Lazy<bool> write_sse_event(sse_event event) {
+    sse_payload_ = serialize_sse_event(event);
+    return write_sse_payload();
+  }
+
+  async_simple::coro::Lazy<bool> write_sse_data(std::string data) {
+    sse_payload_ = serialize_sse_event(sse_event{.data = std::move(data)});
+    return write_sse_payload();
+  }
+
+  async_simple::coro::Lazy<bool> write_sse_comment(std::string comment) {
+    sse_payload_.clear();
+    append_sse_field(sse_payload_, "", comment, true);
+    sse_payload_.append(CRCF);
+    return write_sse_payload();
+  }
+
+  async_simple::coro::Lazy<bool> end_sse() { co_return co_await end_chunked(); }
 
   async_simple::coro::Lazy<bool> begin_multipart(
       std::string_view boundary = "", std::string_view content_type = "") {
@@ -930,6 +979,29 @@ class coro_http_connection
   }
 
  private:
+  async_simple::coro::Lazy<bool> write_chunked_owned(std::string chunked_data,
+                                                     bool eof = false) {
+    response_.set_delay(true);
+    std::vector<asio::const_buffer> buffers;
+    std::string chunk_size_str;
+    to_chunked_buffers(buffers, chunk_size_str, chunked_data, eof);
+    auto [ec, _] = co_await async_write(buffers);
+    if (ec) {
+      CINATRA_LOG_ERROR << "async_write error: " << ec.message();
+      close();
+      co_return false;
+    }
+
+    co_return true;
+  }
+
+  async_simple::coro::Lazy<bool> write_sse_payload() {
+    response_.set_delay(true);
+    buffers_.clear();
+    to_chunked_buffers(buffers_, chunk_size_str_, sse_payload_, false);
+    co_return co_await reply(false);
+  }
+
   bool check_keep_alive() {
     if (parser_.has_close()) {
       return false;
@@ -978,8 +1050,9 @@ class coro_http_connection
     if (ec) {
       return;
     }
-    address = pt.address().to_string(ec);
-    if (ec) {
+    try {
+      address = pt.address().to_string();
+    } catch (...) {
       return;
     }
     address.append(":").append(std::to_string(pt.port()));
@@ -1040,6 +1113,7 @@ class coro_http_connection
   coro_io::ExecutorWrapper<> *executor_;
   asio::ip::tcp::socket socket_;
   coro_http_router &router_;
+  size_t max_http_header_size_ = 8 * 1024;
   asio::streambuf head_buf_;
   std::string body_;
   asio::streambuf chunked_buf_;
@@ -1056,6 +1130,7 @@ class coro_http_connection
       std::chrono::system_clock::now();
   uint64_t max_part_size_ = 8 * 1024 * 1024;
   std::string resp_str_;
+  bool multipart_body_finished_ = false;
 
 #ifdef CINATRA_ENABLE_GZIP
   bool is_client_ws_compressed_ = false;
@@ -1076,6 +1151,7 @@ class coro_http_connection
                                                coro_http_response &)>
       default_handler_ = nullptr;
   std::string chunk_size_str_;
+  std::string sse_payload_;
   std::string remote_addr_;
   int64_t max_http_body_len_ = 0;
 #ifdef INJECT_FOR_HTTP_SEVER_TEST

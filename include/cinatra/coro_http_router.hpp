@@ -88,8 +88,17 @@ class coro_http_router {
             replace_all(pattern, "{}", "([^/]+)");
           }
 
-          coro_regex_handles_.emplace_back(std::regex(pattern),
-                                           std::move(http_handler));
+          auto it = std::find_if(coro_regex_handles_.begin(),
+                                 coro_regex_handles_.end(), [&](const auto& t) {
+                                   return std::get<2>(t) == pattern;
+                                 });
+          if (it != coro_regex_handles_.end()) {
+            std::get<1>(*it) = std::move(http_handler);
+          }
+          else {
+            coro_regex_handles_.emplace_back(std::regex(pattern),
+                                             std::move(http_handler), pattern);
+          }
         }
         else {
           auto [it, ok] = coro_keys_.emplace(std::move(whole_str));
@@ -134,8 +143,17 @@ class coro_http_router {
           replace_all(pattern, "{}", "([^/]+)");
         }
 
-        regex_handles_.emplace_back(std::regex(pattern),
-                                    std::move(http_handler));
+        auto it = std::find_if(regex_handles_.begin(), regex_handles_.end(),
+                               [&](const auto& t) {
+                                 return std::get<2>(t) == pattern;
+                               });
+        if (it != regex_handles_.end()) {
+          std::get<1>(*it) = std::move(http_handler);
+        }
+        else {
+          regex_handles_.emplace_back(std::regex(pattern),
+                                      std::move(http_handler), pattern);
+        }
       }
       else {
         auto [it, ok] = keys_.emplace(std::move(whole_str));
@@ -288,6 +306,13 @@ class coro_http_router {
     }
   }
 
+  void set_error_handler(
+      std::function<void(coro_http_request&, coro_http_response&,
+                         std::string_view)>
+          handler) {
+    error_handler_ = std::move(handler);
+  }
+
   void route(auto handler, auto& req, auto& resp, std::string_view key) {
     try {
       (*handler)(req, resp);
@@ -295,9 +320,21 @@ class coro_http_router {
       CINATRA_LOG_WARNING << "exception in business function, reason: "
                           << e.what();
       resp.set_status(status_type::service_unavailable);
+      if (error_handler_) {
+        error_handler_(req, resp, e.what());
+      }
+      else {
+        resp.set_content(e.what());
+      }
     } catch (...) {
       CINATRA_LOG_WARNING << "unknown exception in business function";
       resp.set_status(status_type::service_unavailable);
+      if (error_handler_) {
+        error_handler_(req, resp, "unknown exception");
+      }
+      else {
+        resp.set_content("unknown exception");
+      }
     }
   }
 
@@ -309,9 +346,21 @@ class coro_http_router {
       CINATRA_LOG_WARNING << "exception in business function, reason: "
                           << e.what();
       resp.set_status(status_type::service_unavailable);
+      if (error_handler_) {
+        error_handler_(req, resp, e.what());
+      }
+      else {
+        resp.set_content(e.what());
+      }
     } catch (...) {
       CINATRA_LOG_WARNING << "unknown exception in business function";
       resp.set_status(status_type::service_unavailable);
+      if (error_handler_) {
+        error_handler_(req, resp, "unknown exception");
+      }
+      else {
+        resp.set_content("unknown exception");
+      }
     }
   }
 
@@ -330,6 +379,9 @@ class coro_http_router {
   const auto& get_regex_handlers() { return regex_handles_; }
 
  private:
+  std::function<void(coro_http_request&, coro_http_response&, std::string_view)>
+      error_handler_;
+
   std::set<std::string> keys_;
   std::unordered_map<
       std::string_view,
@@ -350,12 +402,14 @@ class coro_http_router {
 
   std::vector<std::tuple<
       std::regex,
-      std::function<void(coro_http_request& req, coro_http_response& resp)>>>
+      std::function<void(coro_http_request& req, coro_http_response& resp)>,
+      std::string>>
       regex_handles_;
 
-  std::vector<std::tuple<
-      std::regex, std::function<async_simple::coro::Lazy<void>(
-                      coro_http_request& req, coro_http_response& resp)>>>
+  std::vector<std::tuple<std::regex,
+                         std::function<async_simple::coro::Lazy<void>(
+                             coro_http_request& req, coro_http_response& resp)>,
+                         std::string>>
       coro_regex_handles_;
 };
 }  // namespace cinatra

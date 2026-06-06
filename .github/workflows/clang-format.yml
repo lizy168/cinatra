@@ -22,14 +22,18 @@ jobs:
         uses: actions/checkout@v3
         with:
           fetch-depth: 0
-      - name: install clang-format
-        run:  sudo apt install clang-format
+      - name: install clang-format-18
+        run: |
+          wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
+          sudo add-apt-repository "deb http://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-18 main"
+          sudo apt-get update
+          sudo apt-get install -y clang-format-18
+          clang-format-18 --version
       - name: check-diff
         run: |
-          diff=`git-clang-format --diff HEAD^`
-          if ! [[ "$diff" = "no modified files to format" || "$diff" = "clang-format did not modify any files" ]]; then
-              echo "The diff you sent is not formatted correctly."
-              echo "The suggested format is"
-              echo "$diff"
-              exit 1
+          changed=$(git diff --name-only HEAD^ HEAD | grep -E '\.(cpp|hpp|h|cc|cxx)$' || true)
+          if [ -z "$changed" ]; then
+            echo "No C/C++ files changed, skipping format check."
+            exit 0
           fi
+          echo "$changed" | xargs clang-format-18 --dry-run --Werror
