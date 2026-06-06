@@ -1,13 +1,18 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
-#include "doctest/doctest.h"
+#include <async_simple/coro/Collect.h>
+#include <async_simple/coro/SyncAwait.h>
 
 #include <algorithm>
-#include <atomic>
 #include <array>
+#include <asio/io_context.hpp>
+#include <asio/ip/tcp.hpp>
+#include <asio/read.hpp>
+#include <asio/write.hpp>
+#include <atomic>
+#include <cctype>
 #include <charconv>
 #include <chrono>
 #include <cstdio>
-#include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -18,18 +23,12 @@
 #include <thread>
 #include <vector>
 
-#include <asio/io_context.hpp>
-#include <asio/ip/tcp.hpp>
-#include <asio/write.hpp>
-#include <asio/read.hpp>
-#include <async_simple/coro/Collect.h>
-#include <async_simple/coro/SyncAwait.h>
-
 #include "cinatra/coro_http_server.hpp"
 #include "cinatra/http2/frame.hpp"
-#include "cinatra/http2/hpack.hpp"
-#include "cinatra/http2/h2_connection.hpp"
 #include "cinatra/http2/h2_client.hpp"
+#include "cinatra/http2/h2_connection.hpp"
+#include "cinatra/http2/hpack.hpp"
+#include "doctest/doctest.h"
 
 using namespace cinatra::http2;
 
@@ -71,18 +70,18 @@ static std::string test_tls_key_path() {
 static std::unique_ptr<asio::ssl::context> make_test_server_ssl_context(
     bool enable_h2_alpn = true) {
   auto ctx = std::make_unique<asio::ssl::context>(asio::ssl::context::sslv23);
-  ctx->set_options(asio::ssl::context::default_workarounds |
-                   asio::ssl::context::no_sslv2 |
-                   asio::ssl::context::no_sslv3 |
-                   asio::ssl::context::no_tlsv1 |
-                   asio::ssl::context::no_tlsv1_1 |
-                   asio::ssl::context::single_dh_use);
-  ctx->set_password_callback([](auto, auto) { return std::string("test"); });
+  ctx->set_options(
+      asio::ssl::context::default_workarounds | asio::ssl::context::no_sslv2 |
+      asio::ssl::context::no_sslv3 | asio::ssl::context::no_tlsv1 |
+      asio::ssl::context::no_tlsv1_1 | asio::ssl::context::single_dh_use);
+  ctx->set_password_callback([](auto, auto) {
+    return std::string("test");
+  });
   ctx->use_certificate_chain_file(test_tls_cert_path());
   ctx->use_private_key_file(test_tls_key_path(), asio::ssl::context::pem);
   if (enable_h2_alpn) {
-    SSL_CTX_set_alpn_select_cb(
-        ctx->native_handle(), select_h2_alpn_callback, nullptr);
+    SSL_CTX_set_alpn_select_cb(ctx->native_handle(), select_h2_alpn_callback,
+                               nullptr);
   }
   return ctx;
 }
@@ -94,25 +93,25 @@ static std::unique_ptr<asio::ssl::context> make_test_server_ssl_context(
 
 TEST_CASE("frame header roundtrip") {
   frame_header orig{
-      .length    = 0x123456,
-      .type      = frame_type::headers,
-      .flags     = flags::END_HEADERS | flags::END_STREAM,
+      .length = 0x123456,
+      .type = frame_type::headers,
+      .flags = flags::END_HEADERS | flags::END_STREAM,
       .stream_id = 0x7FFFFFFF,
   };
   auto bytes = serialize_frame_header(orig);
   CHECK(bytes.size() == 9);
 
   auto parsed = parse_frame_header(bytes);
-  CHECK(parsed.length    == orig.length);
-  CHECK(parsed.type      == orig.type);
-  CHECK(parsed.flags     == orig.flags);
+  CHECK(parsed.length == orig.length);
+  CHECK(parsed.type == orig.type);
+  CHECK(parsed.flags == orig.flags);
   CHECK(parsed.stream_id == orig.stream_id);
 }
 
 TEST_CASE("frame header R-bit is masked") {
   // Bit 31 of stream_id is reserved and must be ignored on receive
-  frame_header h{.length = 0, .type = frame_type::data,
-                 .flags = 0, .stream_id = 1};
+  frame_header h{
+      .length = 0, .type = frame_type::data, .flags = 0, .stream_id = 1};
   auto bytes = serialize_frame_header(h);
   // Force R-bit on in raw bytes
   bytes[5] |= 0x80;
@@ -136,57 +135,54 @@ TEST_CASE("make_frame produces correct bytes") {
   // Stream id = 1
   CHECK((uint8_t)frame[8] == 1);
   // Payload
-  CHECK((uint8_t)frame[9]  == 0xDE);
+  CHECK((uint8_t)frame[9] == 0xDE);
   CHECK((uint8_t)frame[12] == 0xEF);
 }
 
 TEST_CASE("SETTINGS frame build and parse") {
   std::array<settings_entry, 2> entries{
-      settings_entry{settings_param::max_frame_size,      65535},
+      settings_entry{settings_param::max_frame_size, 65535},
       settings_entry{settings_param::initial_window_size, 131072},
   };
   auto frame = make_settings_frame(entries);
 
   // Frame header checks
-  auto hdr = parse_frame_header(
-      std::span<const uint8_t, 9>(
-          reinterpret_cast<const uint8_t*>(frame.data()), 9));
-  CHECK(hdr.type      == frame_type::settings);
-  CHECK(hdr.flags     == 0);
+  auto hdr = parse_frame_header(std::span<const uint8_t, 9>(
+      reinterpret_cast<const uint8_t*>(frame.data()), 9));
+  CHECK(hdr.type == frame_type::settings);
+  CHECK(hdr.flags == 0);
   CHECK(hdr.stream_id == 0);
-  CHECK(hdr.length    == 12);  // 2 entries x 6 bytes
+  CHECK(hdr.length == 12);  // 2 entries x 6 bytes
 
   // Payload parsing
   auto payload = std::span<const uint8_t>(
       reinterpret_cast<const uint8_t*>(frame.data()) + 9, hdr.length);
   auto parsed = parse_settings_payload(payload);
   REQUIRE(parsed.size() == 2);
-  CHECK(parsed[0].id    == settings_param::max_frame_size);
+  CHECK(parsed[0].id == settings_param::max_frame_size);
   CHECK(parsed[0].value == 65535);
-  CHECK(parsed[1].id    == settings_param::initial_window_size);
+  CHECK(parsed[1].id == settings_param::initial_window_size);
   CHECK(parsed[1].value == 131072);
 }
 
 TEST_CASE("SETTINGS ACK is empty with ACK flag") {
   auto frame = make_settings_frame({}, true);
-  auto hdr = parse_frame_header(
-      std::span<const uint8_t, 9>(
-          reinterpret_cast<const uint8_t*>(frame.data()), 9));
+  auto hdr = parse_frame_header(std::span<const uint8_t, 9>(
+      reinterpret_cast<const uint8_t*>(frame.data()), 9));
   CHECK(hdr.length == 0);
-  CHECK(hdr.flags  == flags::ACK);
+  CHECK(hdr.flags == flags::ACK);
 }
 
 TEST_CASE("make_rst_stream") {
   auto frame = make_rst_stream(5, h2_error_code::cancel);
-  auto hdr = parse_frame_header(
-      std::span<const uint8_t, 9>(
-          reinterpret_cast<const uint8_t*>(frame.data()), 9));
-  CHECK(hdr.type      == frame_type::rst_stream);
+  auto hdr = parse_frame_header(std::span<const uint8_t, 9>(
+      reinterpret_cast<const uint8_t*>(frame.data()), 9));
+  CHECK(hdr.type == frame_type::rst_stream);
   CHECK(hdr.stream_id == 5);
-  CHECK(hdr.length    == 4);
+  CHECK(hdr.length == 4);
   auto* p = reinterpret_cast<const uint8_t*>(frame.data()) + 9;
-  uint32_t code = (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16)
-                | (uint32_t(p[2]) << 8)  |  uint32_t(p[3]);
+  uint32_t code = (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) |
+                  (uint32_t(p[2]) << 8) | uint32_t(p[3]);
   CHECK(code == uint32_t(h2_error_code::cancel));
 }
 
@@ -205,7 +201,7 @@ TEST_CASE("hpack decode: indexed field from static table") {
   hpack_decoder dec;
   auto hdrs = dec.decode(block);
   REQUIRE(hdrs.size() == 1);
-  CHECK(hdrs[0].name  == ":method");
+  CHECK(hdrs[0].name == ":method");
   CHECK(hdrs[0].value == "GET");
 }
 
@@ -215,9 +211,12 @@ TEST_CASE("hpack decode: multiple static indexed fields") {
   hpack_decoder dec;
   auto hdrs = dec.decode(block);
   REQUIRE(hdrs.size() == 3);
-  CHECK(hdrs[0].name  == ":method"); CHECK(hdrs[0].value == "GET");
-  CHECK(hdrs[1].name  == ":path");   CHECK(hdrs[1].value == "/");
-  CHECK(hdrs[2].name  == ":scheme"); CHECK(hdrs[2].value == "https");
+  CHECK(hdrs[0].name == ":method");
+  CHECK(hdrs[0].value == "GET");
+  CHECK(hdrs[1].name == ":path");
+  CHECK(hdrs[1].value == "/");
+  CHECK(hdrs[2].name == ":scheme");
+  CHECK(hdrs[2].value == "https");
 }
 
 TEST_CASE("hpack decode: literal with incremental indexing, new name+value") {
@@ -225,16 +224,16 @@ TEST_CASE("hpack decode: literal with incremental indexing, new name+value") {
   // name  = "x-custom"  (length 8, no huffman)
   // value = "hello"     (length 5, no huffman)
   std::vector<uint8_t> block;
-  block.push_back(0x40);           // literal, incremental, new name
-  block.push_back(0x08);           // name length = 8
+  block.push_back(0x40);  // literal, incremental, new name
+  block.push_back(0x08);  // name length = 8
   for (char c : std::string("x-custom")) block.push_back(uint8_t(c));
-  block.push_back(0x05);           // value length = 5
+  block.push_back(0x05);  // value length = 5
   for (char c : std::string("hello")) block.push_back(uint8_t(c));
 
   hpack_decoder dec;
   auto hdrs = dec.decode(block);
   REQUIRE(hdrs.size() == 1);
-  CHECK(hdrs[0].name  == "x-custom");
+  CHECK(hdrs[0].name == "x-custom");
   CHECK(hdrs[0].value == "hello");
 }
 
@@ -243,15 +242,16 @@ TEST_CASE("hpack decode: literal incremental indexing, indexed name") {
   // Actually index 28 is "content-length"
   // 0x40 | 28 = 0x5C
   std::vector<uint8_t> block;
-  block.push_back(0x40 | 28);  // literal incr., name = static[28] = content-length
-  block.push_back(0x02);       // value length = 2
+  block.push_back(0x40 |
+                  28);    // literal incr., name = static[28] = content-length
+  block.push_back(0x02);  // value length = 2
   block.push_back('4');
   block.push_back('2');
 
   hpack_decoder dec;
   auto hdrs = dec.decode(block);
   REQUIRE(hdrs.size() == 1);
-  CHECK(hdrs[0].name  == "content-length");
+  CHECK(hdrs[0].name == "content-length");
   CHECK(hdrs[0].value == "42");
 }
 
@@ -267,7 +267,7 @@ TEST_CASE("hpack decode: literal without indexing") {
   hpack_decoder dec;
   auto hdrs = dec.decode(block);
   REQUIRE(hdrs.size() == 1);
-  CHECK(hdrs[0].name  == "host");
+  CHECK(hdrs[0].name == "host");
   CHECK(hdrs[0].value == "localhost");
 }
 
@@ -289,7 +289,7 @@ TEST_CASE("hpack dynamic table is populated by incremental indexing") {
   std::array<uint8_t, 1> block2{0x80 | 62};  // indexed, index 62
   auto hdrs2 = dec.decode(block2);
   REQUIRE(hdrs2.size() == 1);
-  CHECK(hdrs2[0].name  == "x-foo");
+  CHECK(hdrs2[0].name == "x-foo");
   CHECK(hdrs2[0].value == "bar");
 }
 
@@ -324,11 +324,23 @@ TEST_CASE("hpack encode_string prefers Huffman when shorter") {
   CHECK(out[0] == 0x8c);
   CHECK(std::vector<uint8_t>(out.begin() + 1, out.end()) ==
         std::vector<uint8_t>{
-            0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff,
+            0xf1,
+            0xe3,
+            0xc2,
+            0xe5,
+            0xf2,
+            0x3a,
+            0x6b,
+            0xa0,
+            0xab,
+            0x90,
+            0xf4,
+            0xff,
         });
 }
 
-TEST_CASE("hpack encode_string keeps plain literal when Huffman is not smaller") {
+TEST_CASE(
+    "hpack encode_string keeps plain literal when Huffman is not smaller") {
   std::vector<uint8_t> out;
   encode_string(out, "a");
 
@@ -367,10 +379,8 @@ TEST_CASE("hpack integer decode roundtrip") {
 
 TEST_CASE("hpack encode + decode roundtrip") {
   std::vector<header_field> input{
-      {":method",    "GET"},
-      {":path",      "/hello"},
-      {":scheme",    "https"},
-      {":authority", "example.com"},
+      {":method", "GET"},         {":path", "/hello"},
+      {":scheme", "https"},       {":authority", "example.com"},
       {"user-agent", "test/1.0"},
   };
 
@@ -382,7 +392,7 @@ TEST_CASE("hpack encode + decode roundtrip") {
 
   REQUIRE(output.size() == input.size());
   for (size_t i = 0; i < input.size(); ++i) {
-    CHECK(output[i].name  == input[i].name);
+    CHECK(output[i].name == input[i].name);
     CHECK(output[i].value == input[i].value);
   }
 }
@@ -408,9 +418,8 @@ TEST_CASE("hpack encoder uses indexed name from static table") {
 TEST_CASE("nghttp2-inspired frame: PING ACK payload roundtrip") {
   std::array<uint8_t, 8> ping_data{1, 2, 3, 4, 5, 6, 7, 8};
   auto frame = make_ping_ack(ping_data);
-  auto hdr = parse_frame_header(
-      std::span<const uint8_t, 9>(
-          reinterpret_cast<const uint8_t*>(frame.data()), 9));
+  auto hdr = parse_frame_header(std::span<const uint8_t, 9>(
+      reinterpret_cast<const uint8_t*>(frame.data()), 9));
 
   CHECK(hdr.type == frame_type::ping);
   CHECK(hdr.flags == flags::ACK);
@@ -423,32 +432,29 @@ TEST_CASE("nghttp2-inspired frame: PING ACK payload roundtrip") {
         std::vector<uint8_t>(ping_data.begin(), ping_data.end()));
 }
 
-TEST_CASE("nghttp2-inspired frame: GOAWAY payload encodes last stream and error") {
+TEST_CASE(
+    "nghttp2-inspired frame: GOAWAY payload encodes last stream and error") {
   auto frame = make_goaway(0x7fffffffu, h2_error_code::protocol_error);
-  auto hdr = parse_frame_header(
-      std::span<const uint8_t, 9>(
-          reinterpret_cast<const uint8_t*>(frame.data()), 9));
+  auto hdr = parse_frame_header(std::span<const uint8_t, 9>(
+      reinterpret_cast<const uint8_t*>(frame.data()), 9));
   REQUIRE(hdr.type == frame_type::goaway);
   REQUIRE(hdr.length == 8);
 
   auto payload = reinterpret_cast<const uint8_t*>(frame.data()) + 9;
   uint32_t last_stream_id = ((uint32_t(payload[0]) & 0x7f) << 24) |
                             (uint32_t(payload[1]) << 16) |
-                            (uint32_t(payload[2]) << 8) |
-                            uint32_t(payload[3]);
+                            (uint32_t(payload[2]) << 8) | uint32_t(payload[3]);
   uint32_t error_code = (uint32_t(payload[4]) << 24) |
                         (uint32_t(payload[5]) << 16) |
-                        (uint32_t(payload[6]) << 8) |
-                        uint32_t(payload[7]);
+                        (uint32_t(payload[6]) << 8) | uint32_t(payload[7]);
   CHECK(last_stream_id == 0x7fffffffu);
   CHECK(error_code == uint32_t(h2_error_code::protocol_error));
 }
 
 TEST_CASE("nghttp2-inspired frame: WINDOW_UPDATE payload encodes increment") {
   auto frame = make_window_update(13, 4096);
-  auto hdr = parse_frame_header(
-      std::span<const uint8_t, 9>(
-          reinterpret_cast<const uint8_t*>(frame.data()), 9));
+  auto hdr = parse_frame_header(std::span<const uint8_t, 9>(
+      reinterpret_cast<const uint8_t*>(frame.data()), 9));
   REQUIRE(hdr.type == frame_type::window_update);
   REQUIRE(hdr.stream_id == 13);
   REQUIRE(hdr.length == 4);
@@ -456,8 +462,7 @@ TEST_CASE("nghttp2-inspired frame: WINDOW_UPDATE payload encodes increment") {
   auto payload = reinterpret_cast<const uint8_t*>(frame.data()) + 9;
   uint32_t increment = ((uint32_t(payload[0]) & 0x7f) << 24) |
                        (uint32_t(payload[1]) << 16) |
-                       (uint32_t(payload[2]) << 8) |
-                       uint32_t(payload[3]);
+                       (uint32_t(payload[2]) << 8) | uint32_t(payload[3]);
   CHECK(increment == 4096);
 }
 
@@ -467,10 +472,13 @@ TEST_CASE("nghttp2-inspired hpack: indexed index 0 is invalid") {
   CHECK_THROWS(dec.decode(block));
 }
 
-TEST_CASE("nghttp2-inspired hpack: literal without indexing does not populate dynamic table") {
+TEST_CASE(
+    "nghttp2-inspired hpack: literal without indexing does not populate "
+    "dynamic table") {
   hpack_decoder dec;
   std::vector<uint8_t> block;
-  encode_integer(block, 58, 4, 0x00);  // user-agent from static table, no indexing
+  encode_integer(block, 58, 4,
+                 0x00);  // user-agent from static table, no indexing
   encode_string(block, "nghttp2");
 
   auto hdrs = dec.decode(block);
@@ -482,7 +490,9 @@ TEST_CASE("nghttp2-inspired hpack: literal without indexing does not populate dy
   CHECK_THROWS(dec.decode(dyn_idx));
 }
 
-TEST_CASE("nghttp2-inspired hpack: new name without indexing does not populate dynamic table") {
+TEST_CASE(
+    "nghttp2-inspired hpack: new name without indexing does not populate "
+    "dynamic table") {
   hpack_decoder dec;
   std::vector<uint8_t> block;
   block.push_back(0x00);
@@ -498,7 +508,9 @@ TEST_CASE("nghttp2-inspired hpack: new name without indexing does not populate d
   CHECK_THROWS(dec.decode(dyn_idx));
 }
 
-TEST_CASE("nghttp2-inspired hpack: sequential deflate inflate roundtrip preserves header sets") {
+TEST_CASE(
+    "nghttp2-inspired hpack: sequential deflate inflate roundtrip preserves "
+    "header sets") {
   hpack_encoder enc;
   hpack_decoder dec;
 
@@ -537,7 +549,8 @@ TEST_CASE("nghttp2-inspired hpack: sequential deflate inflate roundtrip preserve
   }
 }
 
-TEST_CASE("nghttp2-inspired hpack: zero-length Huffman string decodes to empty") {
+TEST_CASE(
+    "nghttp2-inspired hpack: zero-length Huffman string decodes to empty") {
   std::span<const uint8_t> buf;
   std::array<uint8_t, 1> encoded{0x80};
   buf = encoded;
@@ -546,7 +559,9 @@ TEST_CASE("nghttp2-inspired hpack: zero-length Huffman string decodes to empty")
   CHECK(buf.empty());
 }
 
-TEST_CASE("nghttp2-inspired hpack: table size update to zero evicts dynamic entries") {
+TEST_CASE(
+    "nghttp2-inspired hpack: table size update to zero evicts dynamic "
+    "entries") {
   hpack_decoder dec;
 
   std::vector<uint8_t> add_block;
@@ -566,7 +581,9 @@ TEST_CASE("nghttp2-inspired hpack: table size update to zero evicts dynamic entr
   CHECK_THROWS(dec.decode(dyn_idx));
 }
 
-TEST_CASE("nghttp2-inspired hpack: oversized indexed entry is not inserted after table shrink") {
+TEST_CASE(
+    "nghttp2-inspired hpack: oversized indexed entry is not inserted after "
+    "table shrink") {
   hpack_decoder dec;
   std::vector<uint8_t> resize_block;
   encode_integer(resize_block, 32, 5, 0x20);
@@ -589,7 +606,9 @@ TEST_CASE("nghttp2-inspired hpack: table size update after header is invalid") {
   CHECK_THROWS(dec.decode(block));
 }
 
-TEST_CASE("nghttp2-inspired hpack: table size update beyond configured limit is invalid") {
+TEST_CASE(
+    "nghttp2-inspired hpack: table size update beyond configured limit is "
+    "invalid") {
   hpack_decoder dec;
   dec.set_max_dynamic_table_size(111);
 
@@ -632,7 +651,9 @@ struct server_runner {
 
   server_runner() {
     exec = std::make_unique<coro_io::ExecutorWrapper<>>(ioc.get_executor());
-    ioc_thread = std::thread([this] { ioc.run(); });
+    ioc_thread = std::thread([this] {
+      ioc.run();
+    });
   }
 
   void launch(h2_handler handler) {
@@ -648,7 +669,8 @@ struct server_runner {
           asio::ip::tcp::socket sock(ioc);
           std::error_code ec;
           acc->accept(sock, ec);
-          if (ec) return;
+          if (ec)
+            return;
           set_test_socket_timeouts(sock);
           auto conn = std::make_shared<coro_http2_connection>(
               std::move(sock), std::move(handler), exec_ptr);
@@ -683,13 +705,16 @@ struct server_runner {
         conn->force_close();
         break;
       }
-      if (!conn_thread.joinable()) break;
+      if (!conn_thread.joinable())
+        break;
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
-    if (conn_thread.joinable()) conn_thread.join();
+    if (conn_thread.joinable())
+      conn_thread.join();
     work.reset();
     ioc.stop();
-    if (ioc_thread.joinable()) ioc_thread.join();
+    if (ioc_thread.joinable())
+      ioc_thread.join();
   }
   ~server_runner() { stop(); }
 
@@ -713,7 +738,9 @@ struct ioc_runner {
 
   ioc_runner() {
     exec = std::make_unique<coro_io::ExecutorWrapper<>>(ioc.get_executor());
-    thread = std::thread([this] { ioc.run(); });
+    thread = std::thread([this] {
+      ioc.run();
+    });
   }
 
   void stop() {
@@ -727,21 +754,25 @@ struct ioc_runner {
     }
 
     for (auto& acceptor : acceptors_to_close) {
-      if (!acceptor) continue;
+      if (!acceptor)
+        continue;
       std::error_code ignored;
       acceptor->cancel(ignored);
       acceptor->close(ignored);
     }
     for (auto& conn : conns_to_close) {
-      if (conn) conn->force_close();
+      if (conn)
+        conn->force_close();
     }
 
     for (auto& worker : workers) {
-      if (worker.joinable()) worker.join();
+      if (worker.joinable())
+        worker.join();
     }
     work.reset();
     ioc.stop();
-    if (thread.joinable()) thread.join();
+    if (thread.joinable())
+      thread.join();
   }
 
   ~ioc_runner() { stop(); }
@@ -772,13 +803,15 @@ static std::string build_get_frames(const std::string& path) {
 
   hpack_encoder enc;
   std::vector<header_field> hdrs{
-      {":method", "GET"}, {":path", path},
-      {":scheme", "http"}, {":authority", "localhost"},
+      {":method", "GET"},
+      {":path", path},
+      {":scheme", "http"},
+      {":authority", "localhost"},
   };
   auto block = enc.encode(hdrs);
-  frames += make_frame(frame_type::headers,
-                        flags::END_HEADERS | flags::END_STREAM, 1,
-                        std::span<const uint8_t>(block));
+  frames +=
+      make_frame(frame_type::headers, flags::END_HEADERS | flags::END_STREAM, 1,
+                 std::span<const uint8_t>(block));
   return frames;
 }
 
@@ -818,8 +851,7 @@ static std::string make_large_header_value(size_t size) {
   constexpr std::string_view alphabet =
       "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
   std::string out(size, '\0');
-  for (size_t i = 0; i < size; ++i)
-    out[i] = alphabet[i % alphabet.size()];
+  for (size_t i = 0; i < size; ++i) out[i] = alphabet[i % alphabet.size()];
   return out;
 }
 
@@ -827,8 +859,9 @@ static std::vector<uint8_t> make_priority_payload(uint32_t stream_dependency,
                                                   uint8_t weight = 0,
                                                   bool exclusive = false) {
   return {
-      static_cast<uint8_t>(static_cast<uint8_t>((stream_dependency >> 24) & 0x7f) |
-                           static_cast<uint8_t>(exclusive ? 0x80 : 0x00)),
+      static_cast<uint8_t>(
+          static_cast<uint8_t>((stream_dependency >> 24) & 0x7f) |
+          static_cast<uint8_t>(exclusive ? 0x80 : 0x00)),
       static_cast<uint8_t>(stream_dependency >> 16),
       static_cast<uint8_t>(stream_dependency >> 8),
       static_cast<uint8_t>(stream_dependency),
@@ -838,7 +871,8 @@ static std::vector<uint8_t> make_priority_payload(uint32_t stream_dependency,
 
 static std::string build_priority_header_frame(
     const std::vector<header_field>& hdrs, uint32_t stream_dependency,
-    uint8_t header_flags = flags::END_HEADERS | flags::END_STREAM | flags::PRIORITY,
+    uint8_t header_flags = flags::END_HEADERS | flags::END_STREAM |
+                           flags::PRIORITY,
     uint32_t stream_id = 1, uint8_t weight = 0, bool exclusive = false) {
   hpack_encoder enc;
   auto block = enc.encode(hdrs);
@@ -886,31 +920,42 @@ static std::pair<int, std::string> read_h2_response(
     if (hdr.type == frame_type::settings && !(hdr.flags & flags::ACK)) {
       auto ack = make_settings_frame({}, true);
       asio::write(sock, asio::buffer(ack), ec);
-    } else if (hdr.type == frame_type::headers) {
+    }
+    else if (hdr.type == frame_type::headers) {
       header_block.assign(payload.begin(), payload.end());
       header_stream_id = hdr.stream_id;
       header_end_stream = (hdr.flags & flags::END_STREAM) != 0;
-      if (!(hdr.flags & flags::END_HEADERS)) continue;
+      if (!(hdr.flags & flags::END_HEADERS))
+        continue;
 
       auto decoded = dec.decode(std::span<const uint8_t>(header_block));
       header_block.clear();
       for (auto& h : decoded)
-        if (h.name == ":status") status = std::stoi(h.value);
-      if (header_end_stream) break;
-    } else if (hdr.type == frame_type::continuation) {
-      if (hdr.stream_id != header_stream_id) break;
+        if (h.name == ":status")
+          status = std::stoi(h.value);
+      if (header_end_stream)
+        break;
+    }
+    else if (hdr.type == frame_type::continuation) {
+      if (hdr.stream_id != header_stream_id)
+        break;
       header_block.insert(header_block.end(), payload.begin(), payload.end());
-      if (!(hdr.flags & flags::END_HEADERS)) continue;
+      if (!(hdr.flags & flags::END_HEADERS))
+        continue;
 
       auto decoded = dec.decode(std::span<const uint8_t>(header_block));
       header_block.clear();
       for (auto& h : decoded)
-        if (h.name == ":status") status = std::stoi(h.value);
-      if (header_end_stream) break;
-    } else if (hdr.type == frame_type::data) {
+        if (h.name == ":status")
+          status = std::stoi(h.value);
+      if (header_end_stream)
+        break;
+    }
+    else if (hdr.type == frame_type::data) {
       body.append(reinterpret_cast<const char*>(payload.data()),
                   payload.size());
-      if (hdr.flags & flags::END_STREAM) break;
+      if (hdr.flags & flags::END_STREAM)
+        break;
     }
   }
   return {status, body};
@@ -955,13 +1000,14 @@ static std::optional<h2_frame_event> read_one_frame_event(
     while (!(hdr.flags & flags::END_HEADERS)) {
       std::array<uint8_t, 9> cont_hdr_buf;
       if (!read_exact_with_timeout(
-              sock, std::span<uint8_t>(cont_hdr_buf.data(),
-                                       cont_hdr_buf.size()),
+              sock,
+              std::span<uint8_t>(cont_hdr_buf.data(), cont_hdr_buf.size()),
               std::chrono::milliseconds(2000))) {
         return std::nullopt;
       }
       hdr = parse_frame_header(cont_hdr_buf);
-      if (hdr.type != frame_type::continuation || hdr.stream_id != evt.stream_id)
+      if (hdr.type != frame_type::continuation ||
+          hdr.stream_id != evt.stream_id)
         return std::nullopt;
 
       payload.resize(hdr.length);
@@ -978,7 +1024,8 @@ static std::optional<h2_frame_event> read_one_frame_event(
     evt.headers = dec.decode(std::span<const uint8_t>(header_block));
   }
   else if (hdr.type == frame_type::data) {
-    evt.body.assign(reinterpret_cast<const char*>(payload.data()), payload.size());
+    evt.body.assign(reinterpret_cast<const char*>(payload.data()),
+                    payload.size());
   }
   return evt;
 }
@@ -989,7 +1036,8 @@ static bool read_exact_with_timeout(asio::ip::tcp::socket& sock,
   std::error_code ec;
   bool was_non_blocking = sock.non_blocking();
   sock.non_blocking(true, ec);
-  if (ec) return false;
+  if (ec)
+    return false;
 
   auto restore = [&]() {
     std::error_code ignored;
@@ -1024,8 +1072,8 @@ static bool read_exact_with_timeout(asio::ip::tcp::socket& sock,
   return true;
 }
 
-static bool read_until_frame_type(
-    asio::ip::tcp::socket& sock, frame_type target, int max_frames = 20) {
+static bool read_until_frame_type(asio::ip::tcp::socket& sock,
+                                  frame_type target, int max_frames = 20) {
   std::array<uint8_t, 9> hdr_buf;
   std::vector<uint8_t> payload;
   for (int i = 0; i < max_frames; ++i) {
@@ -1048,18 +1096,21 @@ static bool read_until_frame_type(
 
     if (hdr.type == frame_type::settings && !(hdr.flags & flags::ACK)) {
       asio::write(sock, asio::buffer(make_settings_frame({}, true)), ec);
-      if (ec) return false;
+      if (ec)
+        return false;
       continue;
     }
 
-    if (hdr.type == target) return true;
+    if (hdr.type == target)
+      return true;
   }
   return false;
 }
 
-static bool read_until_frame_type_on_stream(
-    asio::ip::tcp::socket& sock, frame_type target, uint32_t stream_id,
-    int max_frames = 20) {
+static bool read_until_frame_type_on_stream(asio::ip::tcp::socket& sock,
+                                            frame_type target,
+                                            uint32_t stream_id,
+                                            int max_frames = 20) {
   std::array<uint8_t, 9> hdr_buf;
   std::vector<uint8_t> payload;
   for (int i = 0; i < max_frames; ++i) {
@@ -1082,41 +1133,41 @@ static bool read_until_frame_type_on_stream(
 
     if (hdr.type == frame_type::settings && !(hdr.flags & flags::ACK)) {
       asio::write(sock, asio::buffer(make_settings_frame({}, true)), ec);
-      if (ec) return false;
+      if (ec)
+        return false;
       continue;
     }
 
-    if (hdr.type == target && hdr.stream_id == stream_id) return true;
+    if (hdr.type == target && hdr.stream_id == stream_id)
+      return true;
   }
   return false;
 }
 
 static bool send_request_and_expect_goaway(
-    const std::vector<header_field>& hdrs,
-    bool enable_connect_protocol = false,
+    const std::vector<header_field>& hdrs, bool enable_connect_protocol = false,
     uint8_t header_flags = flags::END_HEADERS | flags::END_STREAM,
     uint32_t stream_id = 1) {
   server_runner srv;
   srv.set_enable_connect_protocol(enable_connect_protocol);
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "ok");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "ok");
+        co_return;
+      });
 
   asio::io_context client_ioc;
   asio::ip::tcp::socket client(client_ioc);
   connect_direct(client, srv.port());
   asio::write(client, asio::buffer(
-      build_request_frames(hdrs, header_flags, stream_id)));
+                          build_request_frames(hdrs, header_flags, stream_id)));
   bool got_goaway = read_until_frame_type(client, frame_type::goaway);
   client.close();
   return got_goaway;
 }
 
 static std::pair<int, std::string> send_request_and_read_response(
-    const std::vector<header_field>& hdrs,
-    h2_handler handler,
+    const std::vector<header_field>& hdrs, h2_handler handler,
     bool enable_connect_protocol = false,
     uint8_t header_flags = flags::END_HEADERS | flags::END_STREAM,
     uint32_t stream_id = 1) {
@@ -1128,7 +1179,7 @@ static std::pair<int, std::string> send_request_and_read_response(
   asio::ip::tcp::socket client(client_ioc);
   connect_direct(client, srv.port());
   asio::write(client, asio::buffer(
-      build_request_frames(hdrs, header_flags, stream_id)));
+                          build_request_frames(hdrs, header_flags, stream_id)));
   auto result = read_h2_response(client);
   client.close();
   return result;
@@ -1152,7 +1203,8 @@ static uint16_t start_h2_server(ioc_runner& runner, h2_handler handler) {
         asio::ip::tcp::socket sock(runner.ioc);
         std::error_code ec;
         acc->accept(sock, ec);
-        if (ec) return;
+        if (ec)
+          return;
         set_test_socket_timeouts(sock);
         auto conn = std::make_shared<coro_http2_connection>(
             std::move(sock), std::move(handler), exec_ptr);
@@ -1160,7 +1212,8 @@ static uint16_t start_h2_server(ioc_runner& runner, h2_handler handler) {
           std::scoped_lock lock(runner.mtx);
           runner.http2_connections.push_back(conn);
         }
-        if (runner.stopping.load()) conn->force_close();
+        if (runner.stopping.load())
+          conn->force_close();
         async_simple::coro::syncAwait(conn->start().via(exec_ptr));
       });
 
@@ -1192,8 +1245,8 @@ static bool read_client_preface_and_settings(asio::ip::tcp::socket& sock) {
   std::array<char, CLIENT_PREFACE.size()> preface{};
   if (!read_exact_with_timeout(
           sock,
-          std::span<uint8_t>(
-              reinterpret_cast<uint8_t*>(preface.data()), preface.size()),
+          std::span<uint8_t>(reinterpret_cast<uint8_t*>(preface.data()),
+                             preface.size()),
           std::chrono::milliseconds(2000))) {
     return false;
   }
@@ -1202,9 +1255,9 @@ static bool read_client_preface_and_settings(asio::ip::tcp::socket& sock) {
 
   frame_header hdr{};
   std::vector<uint8_t> payload;
-  if (!read_raw_frame(sock, hdr, payload)) return false;
-  return hdr.type == frame_type::settings &&
-         !(hdr.flags & flags::ACK) &&
+  if (!read_raw_frame(sock, hdr, payload))
+    return false;
+  return hdr.type == frame_type::settings && !(hdr.flags & flags::ACK) &&
          hdr.stream_id == 0;
 }
 
@@ -1214,7 +1267,8 @@ static bool wait_for_client_request_headers(asio::ip::tcp::socket& sock,
   frame_header hdr{};
   std::vector<uint8_t> payload;
   for (int i = 0; i < max_frames; ++i) {
-    if (!read_raw_frame(sock, hdr, payload)) return false;
+    if (!read_raw_frame(sock, hdr, payload))
+      return false;
     if (hdr.type == frame_type::settings ||
         hdr.type == frame_type::window_update) {
       continue;
@@ -1225,21 +1279,23 @@ static bool wait_for_client_request_headers(asio::ip::tcp::socket& sock,
   return false;
 }
 
-static bool saw_client_request_headers_within(
-    asio::ip::tcp::socket& sock, std::chrono::milliseconds timeout,
-    uint32_t stream_id = 1) {
+static bool saw_client_request_headers_within(asio::ip::tcp::socket& sock,
+                                              std::chrono::milliseconds timeout,
+                                              uint32_t stream_id = 1) {
   auto deadline = std::chrono::steady_clock::now() + timeout;
   frame_header hdr{};
   std::vector<uint8_t> payload;
   while (std::chrono::steady_clock::now() < deadline) {
     std::error_code ec;
     if (sock.available(ec) < 9) {
-      if (ec) return false;
+      if (ec)
+        return false;
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
       continue;
     }
 
-    if (!read_raw_frame(sock, hdr, payload)) return false;
+    if (!read_raw_frame(sock, hdr, payload))
+      return false;
     if (hdr.type == frame_type::settings ||
         hdr.type == frame_type::window_update) {
       continue;
@@ -1261,23 +1317,22 @@ struct raw_h2_server_runner {
       std::function<void(asio::ip::tcp::socket&)> script) {
     acceptor.set_option(asio::ip::tcp::acceptor::reuse_address(true));
     port_ = acceptor.local_endpoint().port();
-    server_thread = std::thread(
-        [this, script = std::move(script)]() mutable {
-          try {
-            auto sock = std::make_shared<asio::ip::tcp::socket>(ioc);
-            std::error_code ec;
-            acceptor.accept(*sock, ec);
-            if (ec) return;
-            set_test_socket_timeouts(*sock);
-            {
-              std::scoped_lock lock(active_socket_mtx);
-              active_socket = sock;
-            }
-            script(*sock);
-          }
-          catch (...) {
-          }
-        });
+    server_thread = std::thread([this, script = std::move(script)]() mutable {
+      try {
+        auto sock = std::make_shared<asio::ip::tcp::socket>(ioc);
+        std::error_code ec;
+        acceptor.accept(*sock, ec);
+        if (ec)
+          return;
+        set_test_socket_timeouts(*sock);
+        {
+          std::scoped_lock lock(active_socket_mtx);
+          active_socket = sock;
+        }
+        script(*sock);
+      } catch (...) {
+      }
+    });
   }
 
   uint16_t port() const { return port_; }
@@ -1296,7 +1351,8 @@ struct raw_h2_server_runner {
       sock->shutdown(asio::ip::tcp::socket::shutdown_both, ignored);
       sock->close(ignored);
     }
-    if (server_thread.joinable()) server_thread.join();
+    if (server_thread.joinable())
+      server_thread.join();
   }
 
   ~raw_h2_server_runner() { stop(); }
@@ -1307,22 +1363,24 @@ struct raw_h2_server_runner {
 
 static h2_client_response run_client_with_raw_response(
     std::string response_frames, std::string path = "/") {
-  raw_h2_server_runner srv(
-      [response_frames = std::move(response_frames)](
-          asio::ip::tcp::socket& sock) mutable {
-        if (!read_client_preface_and_settings(sock)) return;
+  raw_h2_server_runner srv([response_frames = std::move(response_frames)](
+                               asio::ip::tcp::socket& sock) mutable {
+    if (!read_client_preface_and_settings(sock))
+      return;
 
-        std::error_code ec;
-        auto settings = make_settings_frame({});
-        asio::write(sock, asio::buffer(settings), ec);
-        if (ec) return;
+    std::error_code ec;
+    auto settings = make_settings_frame({});
+    asio::write(sock, asio::buffer(settings), ec);
+    if (ec)
+      return;
 
-        if (!wait_for_client_request_headers(sock)) return;
+    if (!wait_for_client_request_headers(sock))
+      return;
 
-        asio::write(sock, asio::buffer(response_frames), ec);
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        sock.close(ec);
-      });
+    asio::write(sock, asio::buffer(response_frames), ec);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    sock.close(ec);
+  });
 
   ioc_runner runner;
   coro_http2_client client(runner.exec.get());
@@ -1342,12 +1400,13 @@ static h2_client_response run_client_with_raw_response(
 
 TEST_CASE("integration: HTTP/2 GET returns 200 with body") {
   server_runner srv;
-  srv.launch([](h2_request& req, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(req.path == "/hello" ? 200 : 404,
-                              req.path == "/hello" ? "hello http2" : "not found");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request& req, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(
+            req.path == "/hello" ? 200 : 404,
+            req.path == "/hello" ? "hello http2" : "not found");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   // Client uses a separate blocking io_context (no async needed)
@@ -1359,14 +1418,14 @@ TEST_CASE("integration: HTTP/2 GET returns 200 with body") {
   auto [status, body] = read_h2_response(client);
 
   CHECK(status == 200);
-  CHECK(body   == "hello http2");
+  CHECK(body == "hello http2");
   client.close();
 }
 
 TEST_CASE("integration: unknown path returns 404") {
   server_runner srv;
-  srv.launch([](h2_request& req, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
+  srv.launch([](h2_request& req,
+                h2_response& resp) -> async_simple::coro::Lazy<void> {
     resp.set_status_and_body(req.path == "/exists" ? 200 : 404, "not found");
     co_return;
   });
@@ -1384,11 +1443,11 @@ TEST_CASE("integration: unknown path returns 404") {
 
 TEST_CASE("integration: PING is answered with ACK") {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -1401,8 +1460,8 @@ TEST_CASE("integration: PING is answered with ACK") {
   asio::write(client, asio::buffer(init));
 
   std::array<uint8_t, 8> ping_data{1, 2, 3, 4, 5, 6, 7, 8};
-  asio::write(client, asio::buffer(
-      make_frame(frame_type::ping, 0, 0, ping_data)));
+  asio::write(client,
+              asio::buffer(make_frame(frame_type::ping, 0, 0, ping_data)));
 
   // Scan frames for PING ACK
   bool got_ack = false;
@@ -1411,15 +1470,19 @@ TEST_CASE("integration: PING is answered with ACK") {
   for (int i = 0; i < 10 && !got_ack; ++i) {
     std::error_code ec;
     asio::read(client, asio::buffer(hdr_buf), ec);
-    if (ec) break;
+    if (ec)
+      break;
     auto hdr = parse_frame_header(hdr_buf);
     payload.resize(hdr.length);
-    if (hdr.length > 0) asio::read(client, asio::buffer(payload));
+    if (hdr.length > 0)
+      asio::read(client, asio::buffer(payload));
 
     if (hdr.type == frame_type::settings && !(hdr.flags & flags::ACK)) {
       asio::write(client, asio::buffer(make_settings_frame({}, true)));
-    } else if (hdr.type == frame_type::ping && (hdr.flags & flags::ACK)) {
-      CHECK(payload == std::vector<uint8_t>(ping_data.begin(), ping_data.end()));
+    }
+    else if (hdr.type == frame_type::ping && (hdr.flags & flags::ACK)) {
+      CHECK(payload ==
+            std::vector<uint8_t>(ping_data.begin(), ping_data.end()));
       got_ack = true;
     }
   }
@@ -1429,11 +1492,11 @@ TEST_CASE("integration: PING is answered with ACK") {
 
 TEST_CASE("integration: invalid PING payload length triggers GOAWAY") {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -1445,8 +1508,8 @@ TEST_CASE("integration: invalid PING payload length triggers GOAWAY") {
   asio::write(client, asio::buffer(init));
 
   std::array<uint8_t, 7> bad_ping{1, 2, 3, 4, 5, 6, 7};
-  asio::write(client, asio::buffer(
-      make_frame(frame_type::ping, 0, 0, bad_ping)));
+  asio::write(client,
+              asio::buffer(make_frame(frame_type::ping, 0, 0, bad_ping)));
 
   CHECK(read_until_frame_type(client, frame_type::goaway));
   client.close();
@@ -1454,11 +1517,11 @@ TEST_CASE("integration: invalid PING payload length triggers GOAWAY") {
 
 TEST_CASE("preface: client magic not followed by SETTINGS triggers GOAWAY") {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "ok");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "ok");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -1493,8 +1556,8 @@ static void connect_with_retry(asio::ip::tcp::socket& sock, uint16_t port,
 }
 
 static void connect_direct(asio::ip::tcp::socket& sock, uint16_t port) {
-  sock.connect(asio::ip::tcp::endpoint(
-      asio::ip::make_address("127.0.0.1"), port));
+  sock.connect(
+      asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"), port));
   set_test_socket_timeouts(sock);
 }
 
@@ -1502,15 +1565,17 @@ static std::string base64url_encode(std::span<const uint8_t> data) {
   std::string input(reinterpret_cast<const char*>(data.data()), data.size());
   auto encoded = cinatra::base64_encode(input);
   for (auto& ch : encoded) {
-    if (ch == '+') ch = '-';
-    else if (ch == '/') ch = '_';
+    if (ch == '+')
+      ch = '-';
+    else if (ch == '/')
+      ch = '_';
   }
-  while (!encoded.empty() && encoded.back() == '=')
-    encoded.pop_back();
+  while (!encoded.empty() && encoded.back() == '=') encoded.pop_back();
   return encoded;
 }
 
-static std::string h2c_settings_header(std::span<const settings_entry> settings) {
+static std::string h2c_settings_header(
+    std::span<const settings_entry> settings) {
   auto frame = make_settings_frame(settings);
   auto payload = std::span<const uint8_t>(
       reinterpret_cast<const uint8_t*>(frame.data()) + 9, frame.size() - 9);
@@ -1525,40 +1590,43 @@ static std::string read_http1_response_headers(asio::ip::tcp::socket& sock) {
   while (response.find("\r\n\r\n") == std::string::npos &&
          response.size() < 8192) {
     asio::read(sock, asio::buffer(ch), ec);
-    if (ec) break;
+    if (ec)
+      break;
     response.push_back(ch[0]);
   }
   return response;
 }
 
-static std::string read_http1_response_body(
-    asio::ip::tcp::socket& sock, std::string_view headers) {
+static std::string read_http1_response_body(asio::ip::tcp::socket& sock,
+                                            std::string_view headers) {
   auto lower = std::string(headers);
   std::transform(lower.begin(), lower.end(), lower.begin(),
                  [](unsigned char ch) {
                    return static_cast<char>(std::tolower(ch));
                  });
   auto pos = lower.find("content-length:");
-  if (pos == std::string::npos) return {};
+  if (pos == std::string::npos)
+    return {};
   pos += std::string_view("content-length:").size();
-  while (pos < lower.size() &&
-         (lower[pos] == ' ' || lower[pos] == '\t')) {
+  while (pos < lower.size() && (lower[pos] == ' ' || lower[pos] == '\t')) {
     ++pos;
   }
   auto end = lower.find("\r\n", pos);
-  auto len_text = lower.substr(pos, end == std::string::npos
-                                      ? std::string::npos
-                                      : end - pos);
+  auto len_text = lower.substr(
+      pos, end == std::string::npos ? std::string::npos : end - pos);
   size_t len = 0;
-  auto [ptr, ec] = std::from_chars(
-      len_text.data(), len_text.data() + len_text.size(), len);
-  if (ec != std::errc{} || ptr == len_text.data()) return {};
+  auto [ptr, ec] =
+      std::from_chars(len_text.data(), len_text.data() + len_text.size(), len);
+  if (ec != std::errc{} || ptr == len_text.data())
+    return {};
 
   std::string body(len, '\0');
-  if (len == 0) return body;
-  auto body_span = std::span<uint8_t>(
-      reinterpret_cast<uint8_t*>(body.data()), body.size());
-  if (!read_exact_with_timeout(sock, body_span, std::chrono::milliseconds(2000)))
+  if (len == 0)
+    return body;
+  auto body_span =
+      std::span<uint8_t>(reinterpret_cast<uint8_t*>(body.data()), body.size());
+  if (!read_exact_with_timeout(sock, body_span,
+                               std::chrono::milliseconds(2000)))
     return {};
   return body;
 }
@@ -1575,10 +1643,10 @@ class test_http2_required_server {
   void set_http_handler(std::string path, Func handler) {
     using ret_t =
         std::invoke_result_t<std::decay_t<Func>, h2_request&, h2_response&>;
-    auto adapted =
-        [handler = std::move(handler)](cinatra::coro_http_request& req,
-                                       cinatra::coro_http_response& resp)
-            mutable -> async_simple::coro::Lazy<void> {
+    auto adapted = [handler = std::move(handler)](
+                       cinatra::coro_http_request& req,
+                       cinatra::coro_http_response& resp) mutable
+        -> async_simple::coro::Lazy<void> {
       h2_request h2_req = to_h2_request(req);
       h2_response h2_resp;
       if constexpr (coro_io::is_lazy_v<ret_t>) {
@@ -1594,10 +1662,10 @@ class test_http2_required_server {
   }
 
   void set_default_handler(h2_handler handler) {
-    auto adapted =
-        [handler = std::move(handler)](cinatra::coro_http_request& req,
-                                       cinatra::coro_http_response& resp)
-            -> async_simple::coro::Lazy<void> {
+    auto adapted = [handler = std::move(handler)](
+                       cinatra::coro_http_request& req,
+                       cinatra::coro_http_response& resp)
+        -> async_simple::coro::Lazy<void> {
       h2_request h2_req = to_h2_request(req);
       h2_response h2_resp;
       co_await handler(h2_req, h2_resp);
@@ -1694,9 +1762,8 @@ class test_http2_required_server {
                   });
 
     for (auto& push : source.pushes) {
-      auto& target_push =
-          cinatra::http2::add_push(target, push.path, push.body,
-                                   to_status_type(push.status_code));
+      auto& target_push = cinatra::http2::add_push(
+          target, push.path, push.body, to_status_type(push.status_code));
       target_push.method = push.method;
       target_push.scheme = push.scheme;
       target_push.authority = push.authority;
@@ -1727,8 +1794,8 @@ TEST_CASE("test_http2_required_server: GET /hello returns 200" *
           doctest::skip()) {
   ioc_runner runner;
   test_http2_required_server srv(runner.ioc, 0);
-  srv.set_http_handler<cinatra::GET>("/hello",
-      [](h2_request&, h2_response& resp) {
+  srv.set_http_handler<cinatra::GET>(
+      "/hello", [](h2_request&, h2_response& resp) {
         resp.set_status_and_body(200, "hello from server");
       });
   uint16_t port = srv.start(*runner.exec);
@@ -1756,9 +1823,9 @@ TEST_CASE("test_http2_required_server: unknown route returns 404" *
   ioc_runner runner;
   test_http2_required_server srv(runner.ioc, 0);
   srv.set_http_handler<cinatra::GET>("/only",
-      [](h2_request&, h2_response& resp) {
-        resp.set_status_and_body(200, "ok");
-      });
+                                     [](h2_request&, h2_response& resp) {
+                                       resp.set_status_and_body(200, "ok");
+                                     });
   uint16_t port = srv.start(*runner.exec);
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
@@ -1779,8 +1846,8 @@ TEST_CASE("test_http2_required_server: parameter route dispatches correctly" *
           doctest::skip()) {
   ioc_runner runner;
   test_http2_required_server srv(runner.ioc, 0);
-  srv.set_http_handler<cinatra::GET>("/users/:id",
-      [](h2_request& req, h2_response& resp) {
+  srv.set_http_handler<cinatra::GET>(
+      "/users/:id", [](h2_request& req, h2_response& resp) {
         resp.set_status_and_body(200, req.params_["id"]);
       });
   uint16_t port = srv.start(*runner.exec);
@@ -1804,14 +1871,14 @@ TEST_CASE("test_http2_required_server: parameter route dispatches correctly" *
 TEST_CASE("coro_http_server: default mode serves HTTP/1.1") {
   ioc_runner runner;
   cinatra::coro_http_server srv(runner.ioc, 0);
-  srv.set_http_handler<cinatra::GET>("/hello",
+  srv.set_http_handler<cinatra::GET>(
+      "/hello",
       [](cinatra::coro_http_request& req, cinatra::coro_http_response& resp) {
         auto url = std::string(req.get_url());
         auto query = std::string(req.get_query_value("name"));
         resp.add_header("x-method", std::string(req.get_method()));
-        resp.set_status_and_content(
-            cinatra::status_type::ok,
-            url + ":" + query);
+        resp.set_status_and_content(cinatra::status_type::ok,
+                                    url + ":" + query);
       });
   auto server_future = srv.async_start();
 
@@ -1840,8 +1907,8 @@ TEST_CASE("coro_http_server: cleartext required mode still serves HTTP/1.1") {
   cinatra::coro_http_server srv(runner.ioc, 0);
   srv.set_http2_mode(cinatra::http2_mode::required);
   srv.set_http_handler<cinatra::GET>(
-      "/hello", [](cinatra::coro_http_request&,
-                   cinatra::coro_http_response& resp) {
+      "/hello",
+      [](cinatra::coro_http_request&, cinatra::coro_http_response& resp) {
         resp.set_status_and_content(cinatra::status_type::ok, "http1");
       });
   auto server_future = srv.async_start();
@@ -1896,10 +1963,10 @@ TEST_CASE("coro_http_server: TLS HTTP/2 preserves trailers in common objects") {
   cinatra::coro_http_server srv(runner.ioc, 0);
   srv.set_http2_mode(cinatra::http2_mode::required);
   srv.init_ssl(test_tls_cert_path(), test_tls_key_path(), "test");
-  srv.set_http_handler<cinatra::POST>("/trailers",
+  srv.set_http_handler<cinatra::POST>(
+      "/trailers",
       [](cinatra::coro_http_request& req,
-         cinatra::coro_http_response& resp)
-          -> async_simple::coro::Lazy<void> {
+         cinatra::coro_http_response& resp) -> async_simple::coro::Lazy<void> {
         std::string trailer_value;
         for (auto& trailer : req.get_trailers()) {
           if (trailer.name == "x-tail") {
@@ -1907,10 +1974,10 @@ TEST_CASE("coro_http_server: TLS HTTP/2 preserves trailers in common objects") {
           }
         }
 
-        resp.set_status_and_content(
-            trailer_value == "ok" ? cinatra::status_type::ok
-                                  : cinatra::status_type::bad_request,
-            std::string(req.get_body()));
+        resp.set_status_and_content(trailer_value == "ok"
+                                        ? cinatra::status_type::ok
+                                        : cinatra::status_type::bad_request,
+                                    std::string(req.get_body()));
         resp.add_trailer("x-ack", trailer_value);
         co_return;
       });
@@ -1926,7 +1993,8 @@ TEST_CASE("coro_http_server: TLS HTTP/2 preserves trailers in common objects") {
   request.path = "/trailers";
   request.body = "payload";
   request.add_trailer("x-tail", "ok");
-  auto resp = async_simple::coro::syncAwait(client.async_request(std::move(request)));
+  auto resp =
+      async_simple::coro::syncAwait(client.async_request(std::move(request)));
 
   CHECK(resp.net_err.value() == 0);
   CHECK(resp.status_code == 200);
@@ -1943,12 +2011,14 @@ TEST_CASE("coro_http_server: TLS HTTP/2 preserves trailers in common objects") {
 #endif
 
 #ifdef CINATRA_ENABLE_SSL
-TEST_CASE("test_http2_required_server: h2c upgrade dispatches HTTP/1.1 request as stream 1" *
-          doctest::skip()) {
+TEST_CASE(
+    "test_http2_required_server: h2c upgrade dispatches HTTP/1.1 request as "
+    "stream 1" *
+    doctest::skip()) {
   ioc_runner runner;
   test_http2_required_server srv(runner.ioc, 0);
-  srv.set_http_handler<cinatra::GET>("/upgrade",
-      [](h2_request& req, h2_response& resp) {
+  srv.set_http_handler<cinatra::GET>(
+      "/upgrade", [](h2_request& req, h2_response& resp) {
         resp.set_status_and_body(
             200, req.path == "/upgrade" && req.authority == "localhost"
                      ? "upgraded"
@@ -1969,12 +2039,14 @@ TEST_CASE("test_http2_required_server: h2c upgrade dispatches HTTP/1.1 request a
       "Host: localhost\r\n"
       "Connection: Upgrade, HTTP2-Settings\r\n"
       "Upgrade: h2c\r\n"
-      "HTTP2-Settings: " + h2c_settings_header(settings) + "\r\n\r\n";
+      "HTTP2-Settings: " +
+      h2c_settings_header(settings) + "\r\n\r\n";
   asio::write(client, asio::buffer(request));
 
   auto upgrade_response = read_http1_response_headers(client);
   CAPTURE(upgrade_response);
-  REQUIRE(upgrade_response.find("101 Switching Protocols") != std::string::npos);
+  REQUIRE(upgrade_response.find("101 Switching Protocols") !=
+          std::string::npos);
 
   std::string preface(CLIENT_PREFACE);
   preface += make_settings_frame({});
@@ -1989,12 +2061,14 @@ TEST_CASE("test_http2_required_server: h2c upgrade dispatches HTTP/1.1 request a
   srv.stop();
 }
 
-TEST_CASE("test_http2_required_server: h2c upgrade missing HTTP2-Settings is rejected" *
-          doctest::skip()) {
+TEST_CASE(
+    "test_http2_required_server: h2c upgrade missing HTTP2-Settings is "
+    "rejected" *
+    doctest::skip()) {
   ioc_runner runner;
   test_http2_required_server srv(runner.ioc, 0);
-  srv.set_http_handler<cinatra::GET>("/upgrade",
-      [](h2_request&, h2_response& resp) {
+  srv.set_http_handler<cinatra::GET>(
+      "/upgrade", [](h2_request&, h2_response& resp) {
         resp.set_status_and_body(200, "unexpected");
       });
   uint16_t port = srv.start(*runner.exec);
@@ -2019,12 +2093,14 @@ TEST_CASE("test_http2_required_server: h2c upgrade missing HTTP2-Settings is rej
   srv.stop();
 }
 
-TEST_CASE("test_http2_required_server: h2c upgrade invalid HTTP2-Settings is rejected" *
-          doctest::skip()) {
+TEST_CASE(
+    "test_http2_required_server: h2c upgrade invalid HTTP2-Settings is "
+    "rejected" *
+    doctest::skip()) {
   ioc_runner runner;
   test_http2_required_server srv(runner.ioc, 0);
-  srv.set_http_handler<cinatra::GET>("/upgrade",
-      [](h2_request&, h2_response& resp) {
+  srv.set_http_handler<cinatra::GET>(
+      "/upgrade", [](h2_request&, h2_response& resp) {
         resp.set_status_and_body(200, "unexpected");
       });
   uint16_t port = srv.start(*runner.exec);
@@ -2050,18 +2126,20 @@ TEST_CASE("test_http2_required_server: h2c upgrade invalid HTTP2-Settings is rej
   srv.stop();
 }
 
-TEST_CASE("coro_http2_client: h2c upgrade carries first request body and keeps later requests on HTTP/2" *
-          doctest::skip()) {
+TEST_CASE(
+    "coro_http2_client: h2c upgrade carries first request body and keeps later "
+    "requests on HTTP/2" *
+    doctest::skip()) {
   ioc_runner runner;
   test_http2_required_server srv(runner.ioc, 0);
-  srv.set_http_handler<cinatra::POST>("/upgrade-upload",
-      [](h2_request& req, h2_response& resp) {
+  srv.set_http_handler<cinatra::POST>(
+      "/upgrade-upload", [](h2_request& req, h2_response& resp) {
         resp.set_status_and_body(req.body == "payload" ? 200 : 400, req.body);
       });
   srv.set_http_handler<cinatra::GET>("/after-upgrade",
-      [](h2_request&, h2_response& resp) {
-        resp.set_status_and_body(200, "after");
-      });
+                                     [](h2_request&, h2_response& resp) {
+                                       resp.set_status_and_body(200, "after");
+                                     });
   uint16_t port = srv.start(*runner.exec);
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
@@ -2077,7 +2155,8 @@ TEST_CASE("coro_http2_client: h2c upgrade carries first request body and keeps l
   CHECK(first.status_code == 200);
   CHECK(first.body == "payload");
 
-  auto second = async_simple::coro::syncAwait(client.async_get("/after-upgrade"));
+  auto second =
+      async_simple::coro::syncAwait(client.async_get("/after-upgrade"));
   CHECK(!second.net_err);
   CHECK(second.status_code == 200);
   CHECK(second.body == "after");
@@ -2099,7 +2178,8 @@ TEST_CASE("coro_http2_client: h2c upgrade rejects non-101 response") {
       asio::ip::tcp::socket sock(server_ioc);
       std::error_code ec;
       acceptor.accept(sock, ec);
-      if (ec) return;
+      if (ec)
+        return;
       set_test_socket_timeouts(sock);
       auto request = read_http1_response_headers(sock);
       if (request.find("Upgrade: h2c") == std::string::npos)
@@ -2109,8 +2189,7 @@ TEST_CASE("coro_http2_client: h2c upgrade rejects non-101 response") {
           "Content-Length: 0\r\n\r\n";
       asio::write(sock, asio::buffer(response), ec);
       sock.close(ec);
-    }
-    catch (...) {
+    } catch (...) {
     }
   });
 
@@ -2127,18 +2206,19 @@ TEST_CASE("coro_http2_client: h2c upgrade rejects non-101 response") {
   client.close();
   std::error_code ignored;
   acceptor.close(ignored);
-  if (server_thread.joinable()) server_thread.join();
+  if (server_thread.joinable())
+    server_thread.join();
 }
 
 TEST_CASE("nghttp2-inspired request validation: regular CONNECT is accepted") {
   auto [status, body] = send_request_and_read_response(
-      {{":method", "CONNECT"},
-       {":authority", "upstream.example:443"}},
-      [](h2_request& req, h2_response& resp)
-          -> async_simple::coro::Lazy<void> {
+      {{":method", "CONNECT"}, {":authority", "upstream.example:443"}},
+      [](h2_request& req, h2_response& resp) -> async_simple::coro::Lazy<void> {
         resp.set_status_and_body(
-            req.method == "CONNECT" && req.authority == "upstream.example:443" &&
-                    req.path.empty() && req.scheme.empty() && req.protocol.empty()
+            req.method == "CONNECT" &&
+                    req.authority == "upstream.example:443" &&
+                    req.path.empty() && req.scheme.empty() &&
+                    req.protocol.empty()
                 ? 200
                 : 400,
             "connect");
@@ -2149,37 +2229,40 @@ TEST_CASE("nghttp2-inspired request validation: regular CONNECT is accepted") {
   CHECK(body == "connect");
 }
 
-TEST_CASE("nghttp2-inspired request validation: regular CONNECT with path and scheme triggers RST_STREAM") {
+TEST_CASE(
+    "nghttp2-inspired request validation: regular CONNECT with path and scheme "
+    "triggers RST_STREAM") {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "unexpected");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "unexpected");
+        co_return;
+      });
 
   asio::io_context client_ioc;
   asio::ip::tcp::socket client(client_ioc);
   connect_direct(client, srv.port());
 
   asio::write(client, asio::buffer(build_request_frames(
-      {{":method", "CONNECT"},
-       {":path", "/tunnel"},
-       {":scheme", "https"},
-       {":authority", "upstream.example:443"}})));
+                          {{":method", "CONNECT"},
+                           {":path", "/tunnel"},
+                           {":scheme", "https"},
+                           {":authority", "upstream.example:443"}})));
 
   CHECK(read_until_frame_type_on_stream(client, frame_type::rst_stream, 1));
   client.close();
 }
 
-TEST_CASE("nghttp2-inspired request validation: extended CONNECT is accepted when enabled") {
+TEST_CASE(
+    "nghttp2-inspired request validation: extended CONNECT is accepted when "
+    "enabled") {
   auto [status, body] = send_request_and_read_response(
       {{":method", "CONNECT"},
        {":protocol", "websocket"},
        {":path", "/chat"},
        {":scheme", "https"},
        {":authority", "upstream.example"}},
-      [](h2_request& req, h2_response& resp)
-          -> async_simple::coro::Lazy<void> {
+      [](h2_request& req, h2_response& resp) -> async_simple::coro::Lazy<void> {
         resp.set_status_and_body(
             req.method == "CONNECT" && req.protocol == "websocket" &&
                     req.path == "/chat" && req.scheme == "https" &&
@@ -2195,42 +2278,48 @@ TEST_CASE("nghttp2-inspired request validation: extended CONNECT is accepted whe
   CHECK(body == "extended");
 }
 
-TEST_CASE("nghttp2-inspired request validation: extended CONNECT without setting triggers RST_STREAM") {
+TEST_CASE(
+    "nghttp2-inspired request validation: extended CONNECT without setting "
+    "triggers RST_STREAM") {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "unexpected");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "unexpected");
+        co_return;
+      });
 
   asio::io_context client_ioc;
   asio::ip::tcp::socket client(client_ioc);
   connect_direct(client, srv.port());
 
-  asio::write(client, asio::buffer(build_request_frames(
-      {{":method", "CONNECT"},
-       {":protocol", "websocket"},
-       {":path", "/chat"},
-       {":scheme", "https"},
-       {":authority", "upstream.example"}})));
+  asio::write(
+      client,
+      asio::buffer(build_request_frames({{":method", "CONNECT"},
+                                         {":protocol", "websocket"},
+                                         {":path", "/chat"},
+                                         {":scheme", "https"},
+                                         {":authority", "upstream.example"}})));
 
   CHECK(read_until_frame_type_on_stream(client, frame_type::rst_stream, 1));
   client.close();
 }
 
-TEST_CASE("SETTINGS_MAX_CONCURRENT_STREAMS rejects pipelined stream above advertised limit") {
+TEST_CASE(
+    "SETTINGS_MAX_CONCURRENT_STREAMS rejects pipelined stream above advertised "
+    "limit") {
   auto release_responses = std::make_shared<std::atomic<bool>>(false);
   server_runner srv;
-  srv.launch([release_responses](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    auto* executor = co_await async_simple::CurrentExecutor{};
-    while (!release_responses->load()) {
-      co_await async_simple::coro::sleep(
-          executor, std::chrono::milliseconds(1));
-    }
-    resp.set_status_and_body(204, "");
-    co_return;
-  });
+  srv.launch(
+      [release_responses](h2_request&,
+                          h2_response& resp) -> async_simple::coro::Lazy<void> {
+        auto* executor = co_await async_simple::CurrentExecutor{};
+        while (!release_responses->load()) {
+          co_await async_simple::coro::sleep(executor,
+                                             std::chrono::milliseconds(1));
+        }
+        resp.set_status_and_body(204, "");
+        co_return;
+      });
 
   asio::io_context client_ioc;
   asio::ip::tcp::socket client(client_ioc);
@@ -2239,24 +2328,25 @@ TEST_CASE("SETTINGS_MAX_CONCURRENT_STREAMS rejects pipelined stream above advert
   std::string frames(CLIENT_PREFACE);
   frames += make_settings_frame({});
   for (uint32_t stream_id = 1; stream_id <= 201; stream_id += 2) {
-    frames += build_header_frame(
-        {{":method", "GET"},
-         {":path", "/" + std::to_string(stream_id)},
-         {":scheme", "http"},
-         {":authority", "localhost"}},
-        flags::END_HEADERS | flags::END_STREAM, stream_id);
+    frames +=
+        build_header_frame({{":method", "GET"},
+                            {":path", "/" + std::to_string(stream_id)},
+                            {":scheme", "http"},
+                            {":authority", "localhost"}},
+                           flags::END_HEADERS | flags::END_STREAM, stream_id);
   }
   asio::write(client, asio::buffer(frames));
 
-  CHECK(read_until_frame_type_on_stream(
-      client, frame_type::rst_stream, 201, 260));
+  CHECK(read_until_frame_type_on_stream(client, frame_type::rst_stream, 201,
+                                        260));
   release_responses->store(true);
 
   int response_count = 0;
   for (int i = 0; i < 260 && response_count < 100; ++i) {
     frame_header hdr{};
     std::vector<uint8_t> payload;
-    if (!read_raw_frame(client, hdr, payload)) break;
+    if (!read_raw_frame(client, hdr, payload))
+      break;
     if (hdr.type == frame_type::headers && hdr.stream_id != 201) {
       ++response_count;
     }
@@ -2264,17 +2354,18 @@ TEST_CASE("SETTINGS_MAX_CONCURRENT_STREAMS rejects pipelined stream above advert
   CHECK(response_count == 100);
 
   asio::write(client, asio::buffer(build_header_frame(
-      {{":method", "GET"},
-       {":path", "/after-limit"},
-       {":scheme", "http"},
-       {":authority", "localhost"}},
-      flags::END_HEADERS | flags::END_STREAM, 203)));
+                          {{":method", "GET"},
+                           {":path", "/after-limit"},
+                           {":scheme", "http"},
+                           {":authority", "localhost"}},
+                          flags::END_HEADERS | flags::END_STREAM, 203)));
 
   bool got_after_limit_response = false;
   for (int i = 0; i < 20 && !got_after_limit_response; ++i) {
     frame_header hdr{};
     std::vector<uint8_t> payload;
-    if (!read_raw_frame(client, hdr, payload)) break;
+    if (!read_raw_frame(client, hdr, payload))
+      break;
     got_after_limit_response =
         hdr.type == frame_type::headers && hdr.stream_id == 203;
   }
@@ -2284,8 +2375,8 @@ TEST_CASE("SETTINGS_MAX_CONCURRENT_STREAMS rejects pipelined stream above advert
 
 TEST_CASE("coro_http2_client: regular CONNECT request is encoded correctly") {
   server_runner srv;
-  srv.launch([](h2_request& req, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
+  srv.launch([](h2_request& req,
+                h2_response& resp) -> async_simple::coro::Lazy<void> {
     resp.set_status_and_body(
         req.method == "CONNECT" && req.authority == "upstream.example:443" &&
                 req.path.empty() && req.scheme.empty() && req.protocol.empty()
@@ -2305,7 +2396,8 @@ TEST_CASE("coro_http2_client: regular CONNECT request is encoded correctly") {
   h2_client_request req;
   req.method = "CONNECT";
   req.authority = "upstream.example:443";
-  auto resp = async_simple::coro::syncAwait(client.async_request(std::move(req)));
+  auto resp =
+      async_simple::coro::syncAwait(client.async_request(std::move(req)));
 
   CHECK(!resp.net_err);
   CHECK(resp.status_code == 200);
@@ -2318,17 +2410,17 @@ TEST_CASE("coro_http2_client: regular CONNECT request is encoded correctly") {
 TEST_CASE("coro_http2_client: extended CONNECT request is encoded correctly") {
   server_runner srv;
   srv.set_enable_connect_protocol(true);
-  srv.launch([](h2_request& req, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(
-        req.method == "CONNECT" && req.protocol == "websocket" &&
-                req.path == "/chat" && req.scheme == "https" &&
-                req.authority == "upstream.example"
-            ? 200
-            : 400,
-        "extended");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request& req, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(
+            req.method == "CONNECT" && req.protocol == "websocket" &&
+                    req.path == "/chat" && req.scheme == "https" &&
+                    req.authority == "upstream.example"
+                ? 200
+                : 400,
+            "extended");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   ioc_runner runner;
@@ -2343,7 +2435,8 @@ TEST_CASE("coro_http2_client: extended CONNECT request is encoded correctly") {
   req.path = "/chat";
   req.scheme = "https";
   req.authority = "upstream.example";
-  auto resp = async_simple::coro::syncAwait(client.async_request(std::move(req)));
+  auto resp =
+      async_simple::coro::syncAwait(client.async_request(std::move(req)));
 
   CHECK(!resp.net_err);
   CHECK(resp.status_code == 200);
@@ -2357,11 +2450,10 @@ TEST_CASE("coro_http2_client: GET /hello returns 200") {
   ioc_runner runner;
   uint16_t port = start_h2_server(
       runner,
-      [](h2_request& req, h2_response& resp)
-          -> async_simple::coro::Lazy<void> {
-        resp.set_status_and_body(req.path == "/hello" ? 200 : 404,
-                                 req.path == "/hello" ? "hello from client" :
-                                                        "not found");
+      [](h2_request& req, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(
+            req.path == "/hello" ? 200 : 404,
+            req.path == "/hello" ? "hello from client" : "not found");
         co_return;
       });
 
@@ -2372,8 +2464,7 @@ TEST_CASE("coro_http2_client: GET /hello returns 200") {
       client.connect("127.0.0.1", std::to_string(port)));
   CHECK(!ec);
 
-  auto resp = async_simple::coro::syncAwait(
-      client.async_get("/hello"));
+  auto resp = async_simple::coro::syncAwait(client.async_get("/hello"));
   CHECK(!resp.net_err);
   CHECK(resp.status_code == 200);
   CHECK(resp.body == "hello from client");
@@ -2387,8 +2478,8 @@ TEST_CASE("coro_http2_client/server: TLS with ALPN h2 request succeeds") {
   test_http2_required_server srv(runner.ioc, 0);
   srv.init_ssl(test_tls_cert_path(), test_tls_key_path(), "test");
   srv.set_http_handler<cinatra::GET>(
-      "/hello", [](h2_request&, h2_response& resp)
-          -> async_simple::coro::Lazy<void> {
+      "/hello",
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
         resp.set_status_and_body(200, "hello over tls");
         co_return;
       });
@@ -2415,8 +2506,8 @@ TEST_CASE("coro_http_client: HTTPS ALPN h2 request succeeds") {
   test_http2_required_server srv(runner.ioc, 0);
   srv.init_ssl(test_tls_cert_path(), test_tls_key_path(), "test");
   srv.set_http_handler<cinatra::GET>(
-      "/hello", [](h2_request&, h2_response& resp)
-          -> async_simple::coro::Lazy<void> {
+      "/hello",
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
         resp.set_status_and_body(200, "hello via generic client");
         co_return;
       });
@@ -2424,8 +2515,8 @@ TEST_CASE("coro_http_client: HTTPS ALPN h2 request succeeds") {
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
   cinatra::coro_http_client client(runner.ioc.get_executor());
-  auto resp = async_simple::coro::syncAwait(client.async_get(
-      "https://127.0.0.1:" + std::to_string(port) + "/hello"));
+  auto resp = async_simple::coro::syncAwait(
+      client.async_get("https://127.0.0.1:" + std::to_string(port) + "/hello"));
   CHECK(!resp.net_err);
   CHECK(resp.status == 200);
   CHECK(resp.resp_body == "hello via generic client");
@@ -2447,15 +2538,15 @@ TEST_CASE("coro_http2_client: TLS server without ALPN h2 is rejected") {
       asio::ip::tcp::socket sock(server_ioc);
       std::error_code ec;
       acceptor.accept(sock, ec);
-      if (ec) return;
+      if (ec)
+        return;
       set_test_socket_timeouts(sock);
       auto ssl_ctx = make_test_server_ssl_context(false);
       asio::ssl::stream<asio::ip::tcp::socket&> stream(sock, *ssl_ctx);
       stream.handshake(asio::ssl::stream_base::server, ec);
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
       sock.close(ec);
-    }
-    catch (...) {
+    } catch (...) {
     }
   });
 
@@ -2468,16 +2559,18 @@ TEST_CASE("coro_http2_client: TLS server without ALPN h2 is rejected") {
   client.close();
   std::error_code ignored;
   acceptor.close(ignored);
-  if (server_thread.joinable()) server_thread.join();
+  if (server_thread.joinable())
+    server_thread.join();
 }
 
-TEST_CASE("test_http2_required_server: TLS handshake with non-h2 ALPN is rejected") {
+TEST_CASE(
+    "test_http2_required_server: TLS handshake with non-h2 ALPN is rejected") {
   ioc_runner runner;
   test_http2_required_server srv(runner.ioc, 0);
   srv.init_ssl(test_tls_cert_path(), test_tls_key_path(), "test");
   srv.set_http_handler<cinatra::GET>(
-      "/hello", [](h2_request&, h2_response& resp)
-          -> async_simple::coro::Lazy<void> {
+      "/hello",
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
         resp.set_status_and_body(200, "unused");
         co_return;
       });
@@ -2491,10 +2584,11 @@ TEST_CASE("test_http2_required_server: TLS handshake with non-h2 ALPN is rejecte
   asio::ssl::context ssl_ctx(asio::ssl::context::sslv23);
   ssl_ctx.set_verify_mode(asio::ssl::verify_none);
   asio::ssl::stream<asio::ip::tcp::socket&> stream(sock, ssl_ctx);
-  static constexpr unsigned char HTTP11_ALPN[] = {
-      8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+  static constexpr unsigned char HTTP11_ALPN[] = {8,   'h', 't', 't', 'p',
+                                                  '/', '1', '.', '1'};
   REQUIRE(SSL_set_alpn_protos(stream.native_handle(), HTTP11_ALPN,
-                              static_cast<unsigned int>(sizeof(HTTP11_ALPN))) == 0);
+                              static_cast<unsigned int>(sizeof(HTTP11_ALPN))) ==
+          0);
   std::error_code ec;
   stream.handshake(asio::ssl::stream_base::client, ec);
   CHECK(static_cast<bool>(ec));
@@ -2506,12 +2600,14 @@ TEST_CASE("test_http2_required_server: TLS handshake with non-h2 ALPN is rejecte
 #endif
 
 #ifdef CINATRA_ENABLE_SSL
-TEST_CASE("coro_http2_client/server: server push callback receives promised response") {
+TEST_CASE(
+    "coro_http2_client/server: server push callback receives promised "
+    "response") {
   ioc_runner runner;
   test_http2_required_server srv(runner.ioc, 0);
   srv.init_ssl(test_tls_cert_path(), test_tls_key_path(), "test");
-  srv.set_http_handler<cinatra::GET>("/index",
-      [](h2_request&, h2_response& resp) {
+  srv.set_http_handler<cinatra::GET>(
+      "/index", [](h2_request&, h2_response& resp) {
         auto& push = resp.add_push("/style.css", "body{}");
         push.add_response_header("content-type", "text/css");
         resp.set_status_and_body(200, "<html/>");
@@ -2543,8 +2639,9 @@ TEST_CASE("coro_http2_client/server: server push callback receives promised resp
   CHECK(resp.body == "<html/>");
 
   std::unique_lock lock(mtx);
-  REQUIRE(cv.wait_for(lock, std::chrono::seconds(2),
-                      [&] { return pushed.has_value(); }));
+  REQUIRE(cv.wait_for(lock, std::chrono::seconds(2), [&] {
+    return pushed.has_value();
+  }));
   REQUIRE(pushed.has_value());
   CHECK(pushed->request.method == "GET");
   CHECK(pushed->request.path == "/style.css");
@@ -2566,8 +2663,7 @@ TEST_CASE("coro_http2_client: multiplexed requests share one connection") {
   ioc_runner runner;
   uint16_t port = start_h2_server(
       runner,
-      [](h2_request& req, h2_response& resp)
-          -> async_simple::coro::Lazy<void> {
+      [](h2_request& req, h2_response& resp) -> async_simple::coro::Lazy<void> {
         if (req.path == "/slow")
           co_await coro_io::sleep_for(std::chrono::milliseconds(200));
         resp.set_status_and_body(200, req.path == "/slow" ? "slow" : "fast");
@@ -2582,7 +2678,8 @@ TEST_CASE("coro_http2_client: multiplexed requests share one connection") {
   CHECK(!ec);
 
   auto results = async_simple::coro::syncAwait(
-      [&client]() -> async_simple::coro::Lazy<std::vector<async_simple::Try<h2_client_response>>> {
+      [&client]() -> async_simple::coro::Lazy<
+                      std::vector<async_simple::Try<h2_client_response>>> {
         std::vector<async_simple::coro::Lazy<h2_client_response>> reqs;
         reqs.push_back(client.async_get("/slow"));
         reqs.push_back(client.async_get("/fast"));
@@ -2600,21 +2697,26 @@ TEST_CASE("coro_http2_client: multiplexed requests share one connection") {
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
 }
 
-TEST_CASE("nghttp2-inspired client validation: missing :status yields protocol error") {
-  auto resp = run_client_with_raw_response(
-      build_header_frame({{"server", "foo"}},
-                         flags::END_HEADERS | flags::END_STREAM));
+TEST_CASE(
+    "nghttp2-inspired client validation: missing :status yields protocol "
+    "error") {
+  auto resp = run_client_with_raw_response(build_header_frame(
+      {{"server", "foo"}}, flags::END_HEADERS | flags::END_STREAM));
 
   CHECK(resp.net_err == std::make_error_code(std::errc::protocol_error));
 }
 
-TEST_CASE("nghttp2-inspired client validation: server preface not starting with SETTINGS is rejected") {
+TEST_CASE(
+    "nghttp2-inspired client validation: server preface not starting with "
+    "SETTINGS is rejected") {
   raw_h2_server_runner srv([](asio::ip::tcp::socket& sock) {
-    if (!read_client_preface_and_settings(sock)) return;
+    if (!read_client_preface_and_settings(sock))
+      return;
 
     std::array<uint8_t, 8> ping_data{1, 2, 3, 4, 5, 6, 7, 8};
     std::error_code ec;
-    asio::write(sock, asio::buffer(make_frame(frame_type::ping, 0, 0, ping_data)), ec);
+    asio::write(
+        sock, asio::buffer(make_frame(frame_type::ping, 0, 0, ping_data)), ec);
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     sock.close(ec);
   });
@@ -2637,10 +2739,11 @@ TEST_CASE("nghttp2-inspired client validation: server preface not starting with 
   srv.stop();
 }
 
-TEST_CASE("nghttp2-inspired client validation: informational content-length is rejected") {
-  auto resp = run_client_with_raw_response(
-      build_header_frame({{":status", "100"}, {"content-length", "0"}},
-                         flags::END_HEADERS));
+TEST_CASE(
+    "nghttp2-inspired client validation: informational content-length is "
+    "rejected") {
+  auto resp = run_client_with_raw_response(build_header_frame(
+      {{":status", "100"}, {"content-length", "0"}}, flags::END_HEADERS));
 
   CHECK(resp.net_err == std::make_error_code(std::errc::protocol_error));
 }
@@ -2653,7 +2756,9 @@ TEST_CASE("nghttp2-inspired client validation: duplicate :status is rejected") {
   CHECK(resp.net_err == std::make_error_code(std::errc::protocol_error));
 }
 
-TEST_CASE("nghttp2-inspired client validation: unexpected pseudo header is rejected") {
+TEST_CASE(
+    "nghttp2-inspired client validation: unexpected pseudo header is "
+    "rejected") {
   auto resp = run_client_with_raw_response(
       build_header_frame({{":status", "200"}, {":scheme", "https"}},
                          flags::END_HEADERS | flags::END_STREAM));
@@ -2661,7 +2766,8 @@ TEST_CASE("nghttp2-inspired client validation: unexpected pseudo header is rejec
   CHECK(resp.net_err == std::make_error_code(std::errc::protocol_error));
 }
 
-TEST_CASE("nghttp2-inspired client validation: late pseudo header is rejected") {
+TEST_CASE(
+    "nghttp2-inspired client validation: late pseudo header is rejected") {
   auto resp = run_client_with_raw_response(
       build_header_frame({{"server", "foo"}, {":status", "200"}},
                          flags::END_HEADERS | flags::END_STREAM));
@@ -2669,15 +2775,16 @@ TEST_CASE("nghttp2-inspired client validation: late pseudo header is rejected") 
   CHECK(resp.net_err == std::make_error_code(std::errc::protocol_error));
 }
 
-TEST_CASE("nghttp2-inspired client validation: malformed status code is rejected") {
-  auto resp = run_client_with_raw_response(
-      build_header_frame({{":status", "2000"}},
-                         flags::END_HEADERS | flags::END_STREAM));
+TEST_CASE(
+    "nghttp2-inspired client validation: malformed status code is rejected") {
+  auto resp = run_client_with_raw_response(build_header_frame(
+      {{":status", "2000"}}, flags::END_HEADERS | flags::END_STREAM));
 
   CHECK(resp.net_err == std::make_error_code(std::errc::protocol_error));
 }
 
-TEST_CASE("nghttp2-inspired client validation: invalid content-length is rejected") {
+TEST_CASE(
+    "nghttp2-inspired client validation: invalid content-length is rejected") {
   auto resp = run_client_with_raw_response(
       build_header_frame({{":status", "200"}, {"content-length", "-1"}},
                          flags::END_HEADERS | flags::END_STREAM));
@@ -2685,12 +2792,12 @@ TEST_CASE("nghttp2-inspired client validation: invalid content-length is rejecte
   CHECK(resp.net_err == std::make_error_code(std::errc::protocol_error));
 }
 
-TEST_CASE("nghttp2-inspired client validation: duplicate content-length is rejected") {
-  auto resp = run_client_with_raw_response(
-      build_header_frame({{":status", "200"},
-                          {"content-length", "0"},
-                          {"content-length", "0"}},
-                         flags::END_HEADERS | flags::END_STREAM));
+TEST_CASE(
+    "nghttp2-inspired client validation: duplicate content-length is "
+    "rejected") {
+  auto resp = run_client_with_raw_response(build_header_frame(
+      {{":status", "200"}, {"content-length", "0"}, {"content-length", "0"}},
+      flags::END_HEADERS | flags::END_STREAM));
 
   CHECK(resp.net_err == std::make_error_code(std::errc::protocol_error));
 }
@@ -2703,15 +2810,18 @@ TEST_CASE("nghttp2-inspired client validation: connection header is rejected") {
   CHECK(resp.net_err == std::make_error_code(std::errc::protocol_error));
 }
 
-TEST_CASE("nghttp2-inspired client validation: informational END_STREAM is rejected") {
-  auto resp = run_client_with_raw_response(
-      build_header_frame({{":status", "100"}},
-                         flags::END_HEADERS | flags::END_STREAM));
+TEST_CASE(
+    "nghttp2-inspired client validation: informational END_STREAM is "
+    "rejected") {
+  auto resp = run_client_with_raw_response(build_header_frame(
+      {{":status", "100"}}, flags::END_HEADERS | flags::END_STREAM));
 
   CHECK(resp.net_err == std::make_error_code(std::errc::protocol_error));
 }
 
-TEST_CASE("nghttp2-inspired client validation: informational then final response succeeds") {
+TEST_CASE(
+    "nghttp2-inspired client validation: informational then final response "
+    "succeeds") {
   std::string frames;
   frames += build_header_frame({{":status", "100"}}, flags::END_HEADERS);
   frames += build_header_frame({{":status", "200"}},
@@ -2724,7 +2834,9 @@ TEST_CASE("nghttp2-inspired client validation: informational then final response
   CHECK(resp.body.empty());
 }
 
-TEST_CASE("nghttp2-inspired client validation: informational followed by empty DATA without END_STREAM is accepted") {
+TEST_CASE(
+    "nghttp2-inspired client validation: informational followed by empty DATA "
+    "without END_STREAM is accepted") {
   std::string frames;
   frames += build_header_frame({{":status", "100"}}, flags::END_HEADERS);
   std::vector<uint8_t> empty_payload;
@@ -2738,7 +2850,9 @@ TEST_CASE("nghttp2-inspired client validation: informational followed by empty D
   CHECK(resp.status_code == 200);
 }
 
-TEST_CASE("nghttp2-inspired client validation: informational followed by empty DATA with END_STREAM is rejected") {
+TEST_CASE(
+    "nghttp2-inspired client validation: informational followed by empty DATA "
+    "with END_STREAM is rejected") {
   std::string frames;
   frames += build_header_frame({{":status", "100"}}, flags::END_HEADERS);
   std::vector<uint8_t> empty_payload;
@@ -2749,7 +2863,9 @@ TEST_CASE("nghttp2-inspired client validation: informational followed by empty D
   CHECK(resp.net_err == std::make_error_code(std::errc::protocol_error));
 }
 
-TEST_CASE("nghttp2-inspired client validation: informational followed by nonempty DATA is rejected") {
+TEST_CASE(
+    "nghttp2-inspired client validation: informational followed by nonempty "
+    "DATA is rejected") {
   std::string frames;
   frames += build_header_frame({{":status", "100"}}, flags::END_HEADERS);
   std::vector<uint8_t> payload{'b', 'a', 'd'};
@@ -2760,7 +2876,9 @@ TEST_CASE("nghttp2-inspired client validation: informational followed by nonempt
   CHECK(resp.net_err == std::make_error_code(std::errc::protocol_error));
 }
 
-TEST_CASE("nghttp2-inspired client validation: 204 with zero content-length is accepted") {
+TEST_CASE(
+    "nghttp2-inspired client validation: 204 with zero content-length is "
+    "accepted") {
   auto resp = run_client_with_raw_response(
       build_header_frame({{":status", "204"}, {"content-length", "0"}},
                          flags::END_HEADERS | flags::END_STREAM));
@@ -2769,7 +2887,9 @@ TEST_CASE("nghttp2-inspired client validation: 204 with zero content-length is a
   CHECK(resp.status_code == 204);
 }
 
-TEST_CASE("nghttp2-inspired client validation: 204 with nonzero content-length is rejected") {
+TEST_CASE(
+    "nghttp2-inspired client validation: 204 with nonzero content-length is "
+    "rejected") {
   auto resp = run_client_with_raw_response(
       build_header_frame({{":status", "204"}, {"content-length", "100"}},
                          flags::END_HEADERS | flags::END_STREAM));
@@ -2778,14 +2898,14 @@ TEST_CASE("nghttp2-inspired client validation: 204 with nonzero content-length i
 }
 
 TEST_CASE("nghttp2-inspired client validation: status 101 is rejected") {
-  auto resp = run_client_with_raw_response(
-      build_header_frame({{":status", "101"}},
-                         flags::END_HEADERS | flags::END_STREAM));
+  auto resp = run_client_with_raw_response(build_header_frame(
+      {{":status", "101"}}, flags::END_HEADERS | flags::END_STREAM));
 
   CHECK(resp.net_err == std::make_error_code(std::errc::protocol_error));
 }
 
-TEST_CASE("nghttp2-inspired client validation: host header on response is accepted") {
+TEST_CASE(
+    "nghttp2-inspired client validation: host header on response is accepted") {
   auto resp = run_client_with_raw_response(
       build_header_frame({{":status", "200"}, {"host", "/localhost"}},
                          flags::END_HEADERS | flags::END_STREAM));
@@ -2794,7 +2914,9 @@ TEST_CASE("nghttp2-inspired client validation: host header on response is accept
   CHECK(resp.status_code == 200);
 }
 
-TEST_CASE("nghttp2-inspired client validation: response content-length mismatch on END_STREAM yields protocol error") {
+TEST_CASE(
+    "nghttp2-inspired client validation: response content-length mismatch on "
+    "END_STREAM yields protocol error") {
   auto resp = run_client_with_raw_response(
       build_header_frame({{":status", "200"}, {"content-length", "20"}},
                          flags::END_HEADERS | flags::END_STREAM));
@@ -2802,7 +2924,9 @@ TEST_CASE("nghttp2-inspired client validation: response content-length mismatch 
   CHECK(resp.net_err == std::make_error_code(std::errc::protocol_error));
 }
 
-TEST_CASE("nghttp2-inspired client validation: response content-length mismatch after DATA yields protocol error") {
+TEST_CASE(
+    "nghttp2-inspired client validation: response content-length mismatch "
+    "after DATA yields protocol error") {
   std::string frames;
   frames += build_header_frame({{":status", "200"}, {"content-length", "20"}},
                                flags::END_HEADERS);
@@ -2814,10 +2938,13 @@ TEST_CASE("nghttp2-inspired client validation: response content-length mismatch 
   CHECK(resp.net_err == std::make_error_code(std::errc::protocol_error));
 }
 
-TEST_CASE("nghttp2-inspired client validation: inbound frame exceeding advertised max_frame_size is rejected") {
+TEST_CASE(
+    "nghttp2-inspired client validation: inbound frame exceeding advertised "
+    "max_frame_size is rejected") {
   std::string frames;
   frames += build_header_frame({{":status", "200"}}, flags::END_HEADERS);
-  std::vector<uint8_t> payload(coro_http2_client::MAX_FRAME_SIZE + 1, uint8_t{'x'});
+  std::vector<uint8_t> payload(coro_http2_client::MAX_FRAME_SIZE + 1,
+                               uint8_t{'x'});
   frames += make_frame(frame_type::data, flags::END_STREAM, 1,
                        std::span<const uint8_t>(payload));
 
@@ -2826,10 +2953,10 @@ TEST_CASE("nghttp2-inspired client validation: inbound frame exceeding advertise
   CHECK(resp.net_err == std::make_error_code(std::errc::message_size));
 }
 
-TEST_CASE("nghttp2-inspired client validation: HEADERS on stream 0 is rejected") {
-  auto resp = run_client_with_raw_response(
-      build_header_frame({{":status", "200"}},
-                         flags::END_HEADERS | flags::END_STREAM, 0));
+TEST_CASE(
+    "nghttp2-inspired client validation: HEADERS on stream 0 is rejected") {
+  auto resp = run_client_with_raw_response(build_header_frame(
+      {{":status", "200"}}, flags::END_HEADERS | flags::END_STREAM, 0));
 
   CHECK(resp.net_err == std::make_error_code(std::errc::protocol_error));
 }
@@ -2843,43 +2970,49 @@ TEST_CASE("nghttp2-inspired client validation: DATA on stream 0 is rejected") {
   CHECK(resp.net_err == std::make_error_code(std::errc::protocol_error));
 }
 
-TEST_CASE("nghttp2-inspired client validation: server GOAWAY on nonzero stream is rejected") {
+TEST_CASE(
+    "nghttp2-inspired client validation: server GOAWAY on nonzero stream is "
+    "rejected") {
   std::array<uint8_t, 8> payload{};
   auto resp = run_client_with_raw_response(
-      make_frame(frame_type::goaway, 0, 1,
-                 std::span<const uint8_t>(payload)));
+      make_frame(frame_type::goaway, 0, 1, std::span<const uint8_t>(payload)));
 
   CHECK(resp.net_err == std::make_error_code(std::errc::protocol_error));
 }
 
-TEST_CASE("nghttp2-inspired client validation: server GOAWAY short payload is rejected") {
+TEST_CASE(
+    "nghttp2-inspired client validation: server GOAWAY short payload is "
+    "rejected") {
   std::array<uint8_t, 4> payload{};
   auto resp = run_client_with_raw_response(
-      make_frame(frame_type::goaway, 0, 0,
-                 std::span<const uint8_t>(payload)));
+      make_frame(frame_type::goaway, 0, 0, std::span<const uint8_t>(payload)));
 
   CHECK(resp.net_err == std::make_error_code(std::errc::message_size));
 }
 
-TEST_CASE("nghttp2-inspired client validation: server PING on nonzero stream is rejected") {
+TEST_CASE(
+    "nghttp2-inspired client validation: server PING on nonzero stream is "
+    "rejected") {
   std::array<uint8_t, 8> payload{};
   auto resp = run_client_with_raw_response(
-      make_frame(frame_type::ping, 0, 1,
-                 std::span<const uint8_t>(payload)));
+      make_frame(frame_type::ping, 0, 1, std::span<const uint8_t>(payload)));
 
   CHECK(resp.net_err == std::make_error_code(std::errc::protocol_error));
 }
 
-TEST_CASE("nghttp2-inspired client validation: server WINDOW_UPDATE short payload is rejected") {
+TEST_CASE(
+    "nghttp2-inspired client validation: server WINDOW_UPDATE short payload is "
+    "rejected") {
   std::array<uint8_t, 3> payload{};
-  auto resp = run_client_with_raw_response(
-      make_frame(frame_type::window_update, 0, 0,
-                 std::span<const uint8_t>(payload)));
+  auto resp = run_client_with_raw_response(make_frame(
+      frame_type::window_update, 0, 0, std::span<const uint8_t>(payload)));
 
   CHECK(resp.net_err == std::make_error_code(std::errc::message_size));
 }
 
-TEST_CASE("nghttp2-inspired client validation: server SETTINGS_ENABLE_PUSH is rejected") {
+TEST_CASE(
+    "nghttp2-inspired client validation: server SETTINGS_ENABLE_PUSH is "
+    "rejected") {
   // RFC 7540 section 6.5.2: server MUST NOT set ENABLE_PUSH to anything other
   // than 0. Value 0 is valid; value 2+ is a protocol error.
   std::string frames;
@@ -2895,22 +3028,28 @@ TEST_CASE("nghttp2-inspired client validation: server SETTINGS_ENABLE_PUSH is re
   CHECK(resp.net_err == std::make_error_code(std::errc::protocol_error));
 }
 
-TEST_CASE("nghttp2-inspired client validation: SETTINGS_HEADER_TABLE_SIZE updates outbound encoder") {
+TEST_CASE(
+    "nghttp2-inspired client validation: SETTINGS_HEADER_TABLE_SIZE updates "
+    "outbound encoder") {
   raw_h2_server_runner srv([](asio::ip::tcp::socket& sock) {
-    if (!read_client_preface_and_settings(sock)) return;
+    if (!read_client_preface_and_settings(sock))
+      return;
 
     std::array<settings_entry, 1> settings{
         settings_entry{settings_param::header_table_size, 0},
     };
     std::error_code ec;
     asio::write(sock, asio::buffer(make_settings_frame(settings)), ec);
-    if (ec) return;
+    if (ec)
+      return;
 
     frame_header hdr{};
     std::vector<uint8_t> payload;
     for (int i = 0; i < 20; ++i) {
-      if (!read_raw_frame(sock, hdr, payload)) return;
-      if (hdr.type == frame_type::settings || hdr.type == frame_type::window_update)
+      if (!read_raw_frame(sock, hdr, payload))
+        return;
+      if (hdr.type == frame_type::settings ||
+          hdr.type == frame_type::window_update)
         continue;
       if (hdr.type == frame_type::headers && hdr.stream_id == 1) {
         REQUIRE(!payload.empty());
@@ -2920,8 +3059,8 @@ TEST_CASE("nghttp2-inspired client validation: SETTINGS_HEADER_TABLE_SIZE update
     }
 
     std::string response_frames;
-    response_frames += build_header_frame({{":status", "200"}},
-                                          flags::END_HEADERS, 1);
+    response_frames +=
+        build_header_frame({{":status", "200"}}, flags::END_HEADERS, 1);
     std::vector<uint8_t> ok_payload{'o', 'k'};
     response_frames += make_frame(frame_type::data, flags::END_STREAM, 1,
                                   std::span<const uint8_t>(ok_payload));
@@ -2946,21 +3085,25 @@ TEST_CASE("nghttp2-inspired client validation: SETTINGS_HEADER_TABLE_SIZE update
   srv.stop();
 }
 
-TEST_CASE("coro_http2_client: first request waits for peer SETTINGS before sending HEADERS") {
+TEST_CASE(
+    "coro_http2_client: first request waits for peer SETTINGS before sending "
+    "HEADERS") {
   std::atomic<bool> saw_request_before_settings = false;
   std::atomic<bool> saw_request_after_settings = false;
 
   raw_h2_server_runner srv(
       [&saw_request_before_settings,
        &saw_request_after_settings](asio::ip::tcp::socket& sock) {
-        if (!read_client_preface_and_settings(sock)) return;
+        if (!read_client_preface_and_settings(sock))
+          return;
 
         saw_request_before_settings = saw_client_request_headers_within(
             sock, std::chrono::milliseconds(150));
 
         std::error_code ec;
         asio::write(sock, asio::buffer(make_settings_frame({})), ec);
-        if (ec) return;
+        if (ec)
+          return;
 
         saw_request_after_settings = wait_for_client_request_headers(sock);
         if (!saw_request_after_settings.load()) {
@@ -2969,8 +3112,8 @@ TEST_CASE("coro_http2_client: first request waits for peer SETTINGS before sendi
         }
 
         std::string response_frames;
-        response_frames += build_header_frame({{":status", "200"}},
-                                              flags::END_HEADERS, 1);
+        response_frames +=
+            build_header_frame({{":status", "200"}}, flags::END_HEADERS, 1);
         std::vector<uint8_t> ok_payload{'o', 'k'};
         response_frames += make_frame(frame_type::data, flags::END_STREAM, 1,
                                       std::span<const uint8_t>(ok_payload));
@@ -2996,9 +3139,12 @@ TEST_CASE("coro_http2_client: first request waits for peer SETTINGS before sendi
   srv.stop();
 }
 
-TEST_CASE("coro_http2_client: request waiting on peer SETTINGS fails if peer closes") {
+TEST_CASE(
+    "coro_http2_client: request waiting on peer SETTINGS fails if peer "
+    "closes") {
   raw_h2_server_runner srv([](asio::ip::tcp::socket& sock) {
-    if (!read_client_preface_and_settings(sock)) return;
+    if (!read_client_preface_and_settings(sock))
+      return;
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     std::error_code ec;
     sock.close(ec);
@@ -3017,51 +3163,56 @@ TEST_CASE("coro_http2_client: request waiting on peer SETTINGS fails if peer clo
   srv.stop();
 }
 
-TEST_CASE("coro_http2_client: SETTINGS_MAX_CONCURRENT_STREAMS applies backpressure to new requests") {
+TEST_CASE(
+    "coro_http2_client: SETTINGS_MAX_CONCURRENT_STREAMS applies backpressure "
+    "to new requests") {
   bool saw_stream3_before_first_response = false;
   bool saw_stream3_after_first_response = false;
 
-  raw_h2_server_runner srv(
-      [&saw_stream3_before_first_response,
-       &saw_stream3_after_first_response](asio::ip::tcp::socket& sock) {
-        if (!read_client_preface_and_settings(sock)) return;
+  raw_h2_server_runner srv([&saw_stream3_before_first_response,
+                            &saw_stream3_after_first_response](
+                               asio::ip::tcp::socket& sock) {
+    if (!read_client_preface_and_settings(sock))
+      return;
 
-        std::array<settings_entry, 1> settings{
-            settings_entry{settings_param::max_concurrent_streams, 1},
-        };
-        std::error_code ec;
-        asio::write(sock, asio::buffer(make_settings_frame(settings)), ec);
-        if (ec) return;
+    std::array<settings_entry, 1> settings{
+        settings_entry{settings_param::max_concurrent_streams, 1},
+    };
+    std::error_code ec;
+    asio::write(sock, asio::buffer(make_settings_frame(settings)), ec);
+    if (ec)
+      return;
 
-        if (!wait_for_client_request_headers(sock, 1)) return;
+    if (!wait_for_client_request_headers(sock, 1))
+      return;
 
-        saw_stream3_before_first_response = saw_client_request_headers_within(
-            sock, std::chrono::milliseconds(150), 3);
+    saw_stream3_before_first_response = saw_client_request_headers_within(
+        sock, std::chrono::milliseconds(150), 3);
 
-        std::string response_frames;
-        response_frames += build_header_frame({{":status", "200"}},
-                                             flags::END_HEADERS, 1);
-        std::vector<uint8_t> first_payload{'o', 'n', 'e'};
-        response_frames += make_frame(
-            frame_type::data, flags::END_STREAM, 1,
-            std::span<const uint8_t>(first_payload));
-        asio::write(sock, asio::buffer(response_frames), ec);
-        if (ec) return;
+    std::string response_frames;
+    response_frames +=
+        build_header_frame({{":status", "200"}}, flags::END_HEADERS, 1);
+    std::vector<uint8_t> first_payload{'o', 'n', 'e'};
+    response_frames += make_frame(frame_type::data, flags::END_STREAM, 1,
+                                  std::span<const uint8_t>(first_payload));
+    asio::write(sock, asio::buffer(response_frames), ec);
+    if (ec)
+      return;
 
-        saw_stream3_after_first_response = wait_for_client_request_headers(sock, 3);
-        if (!saw_stream3_after_first_response) return;
+    saw_stream3_after_first_response = wait_for_client_request_headers(sock, 3);
+    if (!saw_stream3_after_first_response)
+      return;
 
-        response_frames.clear();
-        response_frames += build_header_frame({{":status", "200"}},
-                                             flags::END_HEADERS, 3);
-        std::vector<uint8_t> second_payload{'t', 'w', 'o'};
-        response_frames += make_frame(
-            frame_type::data, flags::END_STREAM, 3,
-            std::span<const uint8_t>(second_payload));
-        asio::write(sock, asio::buffer(response_frames), ec);
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        sock.close(ec);
-      });
+    response_frames.clear();
+    response_frames +=
+        build_header_frame({{":status", "200"}}, flags::END_HEADERS, 3);
+    std::vector<uint8_t> second_payload{'t', 'w', 'o'};
+    response_frames += make_frame(frame_type::data, flags::END_STREAM, 3,
+                                  std::span<const uint8_t>(second_payload));
+    asio::write(sock, asio::buffer(response_frames), ec);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    sock.close(ec);
+  });
 
   ioc_runner runner;
   coro_http2_client client(runner.exec.get());
@@ -3071,7 +3222,8 @@ TEST_CASE("coro_http2_client: SETTINGS_MAX_CONCURRENT_STREAMS applies backpressu
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
   auto results = async_simple::coro::syncAwait(
-      [&client]() -> async_simple::coro::Lazy<std::vector<async_simple::Try<h2_client_response>>> {
+      [&client]() -> async_simple::coro::Lazy<
+                      std::vector<async_simple::Try<h2_client_response>>> {
         std::vector<async_simple::coro::Lazy<h2_client_response>> reqs;
         reqs.push_back(client.async_get("/one"));
         reqs.push_back(client.async_get("/two"));
@@ -3092,20 +3244,26 @@ TEST_CASE("coro_http2_client: SETTINGS_MAX_CONCURRENT_STREAMS applies backpressu
   srv.stop();
 }
 
-TEST_CASE("nghttp2-inspired client validation: server PRIORITY on stream 0 is rejected") {
+TEST_CASE(
+    "nghttp2-inspired client validation: server PRIORITY on stream 0 is "
+    "rejected") {
   std::string frames;
   auto payload = make_priority_payload(1);
-  frames += make_frame(frame_type::priority, 0, 0,
-                       std::span<const uint8_t>(payload));
+  frames +=
+      make_frame(frame_type::priority, 0, 0, std::span<const uint8_t>(payload));
 
   auto resp = run_client_with_raw_response(std::move(frames));
 
   CHECK(resp.net_err == std::make_error_code(std::errc::protocol_error));
 }
 
-TEST_CASE("nghttp2-inspired client validation: server PUSH_PROMISE is rejected") {
+TEST_CASE(
+    "nghttp2-inspired client validation: server PUSH_PROMISE is rejected") {
   std::vector<uint8_t> payload{
-      0x00, 0x00, 0x00, 0x02,
+      0x00,
+      0x00,
+      0x00,
+      0x02,
   };
   std::string frames;
   frames += make_frame(frame_type::push_promise, flags::END_HEADERS, 1,
@@ -3116,12 +3274,13 @@ TEST_CASE("nghttp2-inspired client validation: server PUSH_PROMISE is rejected")
   CHECK(resp.net_err == std::make_error_code(std::errc::protocol_error));
 }
 
-TEST_CASE("nghttp2-inspired client validation: response HEADERS priority self-dependency is rejected") {
+TEST_CASE(
+    "nghttp2-inspired client validation: response HEADERS priority "
+    "self-dependency is rejected") {
   std::string frames;
-  frames += build_priority_header_frame({{":status", "200"}}, 1,
-                                        flags::END_HEADERS | flags::END_STREAM |
-                                            flags::PRIORITY,
-                                        1);
+  frames += build_priority_header_frame(
+      {{":status", "200"}}, 1,
+      flags::END_HEADERS | flags::END_STREAM | flags::PRIORITY, 1);
 
   auto resp = run_client_with_raw_response(std::move(frames));
 
@@ -3130,18 +3289,22 @@ TEST_CASE("nghttp2-inspired client validation: response HEADERS priority self-de
 
 TEST_CASE("coro_http2_client: blocked upload is released by RST_STREAM") {
   raw_h2_server_runner srv([](asio::ip::tcp::socket& sock) {
-    if (!read_client_preface_and_settings(sock)) return;
+    if (!read_client_preface_and_settings(sock))
+      return;
 
     std::array<settings_entry, 1> settings{
         settings_entry{settings_param::initial_window_size, 0},
     };
     std::error_code ec;
     asio::write(sock, asio::buffer(make_settings_frame(settings)), ec);
-    if (ec) return;
+    if (ec)
+      return;
 
-    if (!wait_for_client_request_headers(sock)) return;
+    if (!wait_for_client_request_headers(sock))
+      return;
 
-    asio::write(sock, asio::buffer(make_rst_stream(1, h2_error_code::cancel)), ec);
+    asio::write(sock, asio::buffer(make_rst_stream(1, h2_error_code::cancel)),
+                ec);
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     sock.close(ec);
   });
@@ -3168,18 +3331,22 @@ TEST_CASE("coro_http2_client: blocked upload is released by RST_STREAM") {
 
 TEST_CASE("coro_http2_client: blocked upload is released by GOAWAY") {
   raw_h2_server_runner srv([](asio::ip::tcp::socket& sock) {
-    if (!read_client_preface_and_settings(sock)) return;
+    if (!read_client_preface_and_settings(sock))
+      return;
 
     std::array<settings_entry, 1> settings{
         settings_entry{settings_param::initial_window_size, 0},
     };
     std::error_code ec;
     asio::write(sock, asio::buffer(make_settings_frame(settings)), ec);
-    if (ec) return;
+    if (ec)
+      return;
 
-    if (!wait_for_client_request_headers(sock)) return;
+    if (!wait_for_client_request_headers(sock))
+      return;
 
-    asio::write(sock, asio::buffer(make_goaway(1, h2_error_code::no_error)), ec);
+    asio::write(sock, asio::buffer(make_goaway(1, h2_error_code::no_error)),
+                ec);
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     sock.close(ec);
   });
@@ -3204,20 +3371,24 @@ TEST_CASE("coro_http2_client: blocked upload is released by GOAWAY") {
   srv.stop();
 }
 
-TEST_CASE("coro_http2_client: GOAWAY keeps streams up to last_stream_id alive") {
+TEST_CASE(
+    "coro_http2_client: GOAWAY keeps streams up to last_stream_id alive") {
   raw_h2_server_runner srv([](asio::ip::tcp::socket& sock) {
-    if (!read_client_preface_and_settings(sock)) return;
+    if (!read_client_preface_and_settings(sock))
+      return;
 
     std::error_code ec;
     asio::write(sock, asio::buffer(make_settings_frame({})), ec);
-    if (ec) return;
+    if (ec)
+      return;
 
     bool got_stream1 = false;
     bool got_stream3 = false;
     frame_header hdr{};
     std::vector<uint8_t> payload;
     for (int i = 0; i < 20 && (!got_stream1 || !got_stream3); ++i) {
-      if (!read_raw_frame(sock, hdr, payload)) return;
+      if (!read_raw_frame(sock, hdr, payload))
+        return;
       if (hdr.type == frame_type::settings ||
           hdr.type == frame_type::window_update) {
         continue;
@@ -3227,12 +3398,13 @@ TEST_CASE("coro_http2_client: GOAWAY keeps streams up to last_stream_id alive") 
       if (hdr.type == frame_type::headers && hdr.stream_id == 3)
         got_stream3 = true;
     }
-    if (!got_stream1 || !got_stream3) return;
+    if (!got_stream1 || !got_stream3)
+      return;
 
     std::string response_frames;
     response_frames += make_goaway(1, h2_error_code::no_error);
-    response_frames += build_header_frame({{":status", "200"}},
-                                          flags::END_HEADERS, 1);
+    response_frames +=
+        build_header_frame({{":status", "200"}}, flags::END_HEADERS, 1);
     std::vector<uint8_t> ok_payload{'o', 'k'};
     response_frames += make_frame(frame_type::data, flags::END_STREAM, 1,
                                   std::span<const uint8_t>(ok_payload));
@@ -3248,7 +3420,8 @@ TEST_CASE("coro_http2_client: GOAWAY keeps streams up to last_stream_id alive") 
   REQUIRE(!ec);
 
   auto results = async_simple::coro::syncAwait(
-      [&client]() -> async_simple::coro::Lazy<std::vector<async_simple::Try<h2_client_response>>> {
+      [&client]() -> async_simple::coro::Lazy<
+                      std::vector<async_simple::Try<h2_client_response>>> {
         std::vector<async_simple::coro::Lazy<h2_client_response>> reqs;
         reqs.push_back(client.async_get("/ok"));
         reqs.push_back(client.async_get("/ignored"));
@@ -3268,20 +3441,25 @@ TEST_CASE("coro_http2_client: GOAWAY keeps streams up to last_stream_id alive") 
   srv.stop();
 }
 
-TEST_CASE("nghttp2-inspired client validation: malformed response stream does not tear down sibling stream") {
+TEST_CASE(
+    "nghttp2-inspired client validation: malformed response stream does not "
+    "tear down sibling stream") {
   raw_h2_server_runner srv([](asio::ip::tcp::socket& sock) {
-    if (!read_client_preface_and_settings(sock)) return;
+    if (!read_client_preface_and_settings(sock))
+      return;
 
     std::error_code ec;
     asio::write(sock, asio::buffer(make_settings_frame({})), ec);
-    if (ec) return;
+    if (ec)
+      return;
 
     bool got_stream1 = false;
     bool got_stream3 = false;
     frame_header hdr{};
     std::vector<uint8_t> payload;
     for (int i = 0; i < 20 && (!got_stream1 || !got_stream3); ++i) {
-      if (!read_raw_frame(sock, hdr, payload)) return;
+      if (!read_raw_frame(sock, hdr, payload))
+        return;
       if (hdr.type == frame_type::settings ||
           hdr.type == frame_type::window_update) {
         continue;
@@ -3291,14 +3469,14 @@ TEST_CASE("nghttp2-inspired client validation: malformed response stream does no
       if (hdr.type == frame_type::headers && hdr.stream_id == 3)
         got_stream3 = true;
     }
-    if (!got_stream1 || !got_stream3) return;
+    if (!got_stream1 || !got_stream3)
+      return;
 
     std::string response_frames;
-    response_frames += build_header_frame({{"server", "bad"}},
-                                          flags::END_HEADERS | flags::END_STREAM,
-                                          1);
-    response_frames += build_header_frame({{":status", "200"}},
-                                          flags::END_HEADERS, 3);
+    response_frames += build_header_frame(
+        {{"server", "bad"}}, flags::END_HEADERS | flags::END_STREAM, 1);
+    response_frames +=
+        build_header_frame({{":status", "200"}}, flags::END_HEADERS, 3);
     std::vector<uint8_t> ok_payload{'o', 'k'};
     response_frames += make_frame(frame_type::data, flags::END_STREAM, 3,
                                   std::span<const uint8_t>(ok_payload));
@@ -3314,7 +3492,8 @@ TEST_CASE("nghttp2-inspired client validation: malformed response stream does no
   REQUIRE(!ec);
 
   auto results = async_simple::coro::syncAwait(
-      [&client]() -> async_simple::coro::Lazy<std::vector<async_simple::Try<h2_client_response>>> {
+      [&client]() -> async_simple::coro::Lazy<
+                      std::vector<async_simple::Try<h2_client_response>>> {
         std::vector<async_simple::coro::Lazy<h2_client_response>> reqs;
         reqs.push_back(client.async_get("/bad"));
         reqs.push_back(client.async_get("/ok"));
@@ -3324,7 +3503,8 @@ TEST_CASE("nghttp2-inspired client validation: malformed response stream does no
   REQUIRE(results.size() == 2);
   CHECK(!results[0].hasError());
   CHECK(!results[1].hasError());
-  CHECK(results[0].value().net_err == std::make_error_code(std::errc::protocol_error));
+  CHECK(results[0].value().net_err ==
+        std::make_error_code(std::errc::protocol_error));
   CHECK(!results[1].value().net_err);
   CHECK(results[1].value().status_code == 200);
   CHECK(results[1].value().body == "ok");
@@ -3338,14 +3518,12 @@ TEST_CASE("test_http2_required_server: multiple routes dispatch correctly" *
           doctest::skip()) {
   ioc_runner runner;
   test_http2_required_server srv(runner.ioc, 0);
-  srv.set_http_handler<cinatra::GET>("/a",
-      [](h2_request&, h2_response& resp) {
-        resp.set_status_and_body(200, "route-a");
-      });
-  srv.set_http_handler<cinatra::GET>("/b",
-      [](h2_request&, h2_response& resp) {
-        resp.set_status_and_body(200, "route-b");
-      });
+  srv.set_http_handler<cinatra::GET>("/a", [](h2_request&, h2_response& resp) {
+    resp.set_status_and_body(200, "route-a");
+  });
+  srv.set_http_handler<cinatra::GET>("/b", [](h2_request&, h2_response& resp) {
+    resp.set_status_and_body(200, "route-b");
+  });
   uint16_t port = srv.start(*runner.exec);
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
@@ -3365,15 +3543,17 @@ TEST_CASE("test_http2_required_server: multiple routes dispatch correctly" *
   srv.stop();
 }
 
-TEST_CASE("test_http2_required_server: second connection is not blocked by first" *
-          doctest::skip()) {
+TEST_CASE(
+    "test_http2_required_server: second connection is not blocked by first" *
+    doctest::skip()) {
   ioc_runner runner;
   test_http2_required_server srv(runner.ioc, 0);
   std::atomic<bool> slow_started = false;
   std::atomic<bool> release_slow = false;
-  srv.set_http_handler<cinatra::GET>("/slow",
-      [&slow_started, &release_slow](h2_request&, h2_response& resp)
-          -> async_simple::coro::Lazy<void> {
+  srv.set_http_handler<cinatra::GET>(
+      "/slow",
+      [&slow_started, &release_slow](
+          h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
         slow_started = true;
         while (!release_slow.load()) {
           co_await coro_io::sleep_for(std::chrono::milliseconds(10));
@@ -3381,9 +3561,9 @@ TEST_CASE("test_http2_required_server: second connection is not blocked by first
         resp.set_status_and_body(200, "slow");
       });
   srv.set_http_handler<cinatra::GET>("/fast",
-      [](h2_request&, h2_response& resp) {
-        resp.set_status_and_body(200, "fast");
-      });
+                                     [](h2_request&, h2_response& resp) {
+                                       resp.set_status_and_body(200, "fast");
+                                     });
   uint16_t port = srv.start(*runner.exec);
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
@@ -3421,9 +3601,9 @@ TEST_CASE("test_http2_required_server: stop closes active connections" *
   ioc_runner runner;
   test_http2_required_server srv(runner.ioc, 0);
   srv.set_http_handler<cinatra::GET>("/hello",
-      [](h2_request&, h2_response& resp) {
-        resp.set_status_and_body(200, "hello");
-      });
+                                     [](h2_request&, h2_response& resp) {
+                                       resp.set_status_and_body(200, "hello");
+                                     });
   uint16_t port = srv.start(*runner.exec);
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
@@ -3443,7 +3623,8 @@ TEST_CASE("test_http2_required_server: stop closes active connections" *
       asio::read(client, asio::buffer(hdr_buf));
       auto hdr = parse_frame_header(hdr_buf);
       payload.resize(hdr.length);
-      if (hdr.length > 0) asio::read(client, asio::buffer(payload));
+      if (hdr.length > 0)
+        asio::read(client, asio::buffer(payload));
       if (hdr.type == frame_type::settings && !(hdr.flags & flags::ACK)) {
         asio::write(client, asio::buffer(make_settings_frame({}, true)));
         break;
@@ -3475,14 +3656,16 @@ TEST_CASE("test_http2_required_server: stop closes active connections" *
   client.close();
 }
 
-TEST_CASE("test_http2_required_server: stop closes active streams without waiting") {
+TEST_CASE(
+    "test_http2_required_server: stop closes active streams without waiting") {
   ioc_runner runner;
   test_http2_required_server srv(runner.ioc, 0);
   srv.init_ssl(test_tls_cert_path(), test_tls_key_path(), "test");
   std::atomic<bool> handler_started = false;
-  srv.set_http_handler<cinatra::GET>("/slow",
-      [&handler_started](h2_request&, h2_response& resp)
-          -> async_simple::coro::Lazy<void> {
+  srv.set_http_handler<cinatra::GET>(
+      "/slow",
+      [&handler_started](h2_request&,
+                         h2_response& resp) -> async_simple::coro::Lazy<void> {
         handler_started = true;
         co_await coro_io::sleep_for(std::chrono::milliseconds(500));
         resp.set_status_and_body(200, "slow");
@@ -3514,13 +3697,14 @@ TEST_CASE("test_http2_required_server: stop closes active streams without waitin
   client.close();
 }
 
-TEST_CASE("test_http2_required_server: client GOAWAY lets active stream finish" *
-          doctest::skip()) {
+TEST_CASE(
+    "test_http2_required_server: client GOAWAY lets active stream finish" *
+    doctest::skip()) {
   ioc_runner runner;
   test_http2_required_server srv(runner.ioc, 0);
-  srv.set_http_handler<cinatra::GET>("/slow",
-      [](h2_request&, h2_response& resp)
-          -> async_simple::coro::Lazy<void> {
+  srv.set_http_handler<cinatra::GET>(
+      "/slow",
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
         co_await coro_io::sleep_for(std::chrono::milliseconds(150));
         resp.set_status_and_body(200, "slow");
         co_return;
@@ -3547,16 +3731,16 @@ TEST_CASE("test_http2_required_server: client GOAWAY lets active stream finish" 
 
 TEST_CASE("single connection: fast stream is not blocked by slow stream") {
   server_runner srv;
-  srv.launch([](h2_request& req, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    if (req.path == "/slow") {
-      co_await coro_io::sleep_for(std::chrono::milliseconds(300));
-      resp.set_status_and_body(200, "slow");
-      co_return;
-    }
-    resp.set_status_and_body(200, "fast");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request& req, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        if (req.path == "/slow") {
+          co_await coro_io::sleep_for(std::chrono::milliseconds(300));
+          resp.set_status_and_body(200, "slow");
+          co_return;
+        }
+        resp.set_status_and_body(200, "fast");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -3568,22 +3752,26 @@ TEST_CASE("single connection: fast stream is not blocked by slow stream") {
 
   hpack_encoder enc;
   std::vector<header_field> slow_headers{
-      {":method", "GET"}, {":path", "/slow"},
-      {":scheme", "http"}, {":authority", "localhost"},
+      {":method", "GET"},
+      {":path", "/slow"},
+      {":scheme", "http"},
+      {":authority", "localhost"},
   };
   auto slow_block = enc.encode(slow_headers);
-  frames += make_frame(frame_type::headers,
-                       flags::END_HEADERS | flags::END_STREAM, 1,
-                       std::span<const uint8_t>(slow_block));
+  frames +=
+      make_frame(frame_type::headers, flags::END_HEADERS | flags::END_STREAM, 1,
+                 std::span<const uint8_t>(slow_block));
 
   std::vector<header_field> fast_headers{
-      {":method", "GET"}, {":path", "/fast"},
-      {":scheme", "http"}, {":authority", "localhost"},
+      {":method", "GET"},
+      {":path", "/fast"},
+      {":scheme", "http"},
+      {":authority", "localhost"},
   };
   auto fast_block = enc.encode(fast_headers);
-  frames += make_frame(frame_type::headers,
-                       flags::END_HEADERS | flags::END_STREAM, 3,
-                       std::span<const uint8_t>(fast_block));
+  frames +=
+      make_frame(frame_type::headers, flags::END_HEADERS | flags::END_STREAM, 3,
+                 std::span<const uint8_t>(fast_block));
   asio::write(client, asio::buffer(frames));
 
   hpack_decoder dec;
@@ -3592,16 +3780,19 @@ TEST_CASE("single connection: fast stream is not blocked by slow stream") {
   auto start = std::chrono::steady_clock::now();
   std::optional<std::chrono::milliseconds> fast_done_after;
 
-  for (int i = 0; i < 20 && (stream1_body.empty() || stream3_body.empty()); ++i) {
+  for (int i = 0; i < 20 && (stream1_body.empty() || stream3_body.empty());
+       ++i) {
     auto evt = read_one_frame_event(client, dec);
     REQUIRE(evt.has_value());
     if (evt->type == frame_type::settings && !(evt->flags & flags::ACK)) {
       asio::write(client, asio::buffer(make_settings_frame({}, true)));
       continue;
     }
-    if (evt->type != frame_type::data) continue;
+    if (evt->type != frame_type::data)
+      continue;
 
-    if (evt->stream_id == 1) stream1_body += evt->body;
+    if (evt->stream_id == 1)
+      stream1_body += evt->body;
     if (evt->stream_id == 3) {
       stream3_body += evt->body;
       if ((evt->flags & flags::END_STREAM) && !fast_done_after.has_value()) {
@@ -3620,8 +3811,8 @@ TEST_CASE("single connection: fast stream is not blocked by slow stream") {
 
 TEST_CASE("PRIORITY scheduling prefers higher-weight response stream") {
   server_runner srv;
-  srv.launch([](h2_request& req, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
+  srv.launch([](h2_request& req,
+                h2_response& resp) -> async_simple::coro::Lazy<void> {
     resp.set_status_and_body(200, req.path == "/high" ? "HIGH!!" : "lowlow");
     co_return;
   });
@@ -3670,8 +3861,8 @@ TEST_CASE("PRIORITY scheduling prefers higher-weight response stream") {
 
 TEST_CASE("PRIORITY scheduling honors stream dependency before child body") {
   server_runner srv;
-  srv.launch([](h2_request& req, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
+  srv.launch([](h2_request& req,
+                h2_response& resp) -> async_simple::coro::Lazy<void> {
     resp.set_status_and_body(200, req.path == "/parent" ? "PARENT" : "child!");
     co_return;
   });
@@ -3712,7 +3903,8 @@ TEST_CASE("PRIORITY scheduling honors stream dependency before child body") {
       asio::write(client, asio::buffer(make_settings_frame({}, true)));
       continue;
     }
-    if (evt->type != frame_type::data) continue;
+    if (evt->type != frame_type::data)
+      continue;
 
     if (evt->stream_id == 3 && !parent_done)
       saw_child_before_parent_done = true;
@@ -3734,16 +3926,16 @@ TEST_CASE("PRIORITY scheduling honors stream dependency before child body") {
 
 TEST_CASE("PRIORITY reprioritization honors exclusive reparenting") {
   server_runner srv;
-  srv.launch([](h2_request& req, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    if (req.path == "/parent")
-      resp.set_status_and_body(200, "PARENT");
-    else if (req.path == "/sibling")
-      resp.set_status_and_body(200, "SIBLING");
-    else
-      resp.set_status_and_body(200, "EXCLUSV");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request& req, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        if (req.path == "/parent")
+          resp.set_status_and_body(200, "PARENT");
+        else if (req.path == "/sibling")
+          resp.set_status_and_body(200, "SIBLING");
+        else
+          resp.set_status_and_body(200, "EXCLUSV");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -3812,18 +4004,20 @@ TEST_CASE("PRIORITY reprioritization honors exclusive reparenting") {
   client.close();
 }
 
-TEST_CASE("PRIORITY reprioritization breaks ancestor cycles by moving the descendant subtree") {
+TEST_CASE(
+    "PRIORITY reprioritization breaks ancestor cycles by moving the descendant "
+    "subtree") {
   server_runner srv;
-  srv.launch([](h2_request& req, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    if (req.path == "/one")
-      resp.set_status_and_body(200, "ONEONE");
-    else if (req.path == "/three")
-      resp.set_status_and_body(200, "THREEX");
-    else
-      resp.set_status_and_body(200, "FIVE!!");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request& req, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        if (req.path == "/one")
+          resp.set_status_and_body(200, "ONEONE");
+        else if (req.path == "/three")
+          resp.set_status_and_body(200, "THREEX");
+        else
+          resp.set_status_and_body(200, "FIVE!!");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -3878,11 +4072,11 @@ TEST_CASE("PRIORITY reprioritization breaks ancestor cycles by moving the descen
 
 TEST_CASE("response body respects peer initial window size") {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "0123456789");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "0123456789");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -3897,13 +4091,15 @@ TEST_CASE("response body respects peer initial window size") {
 
   hpack_encoder enc;
   std::vector<header_field> hdrs{
-      {":method", "GET"}, {":path", "/win"},
-      {":scheme", "http"}, {":authority", "localhost"},
+      {":method", "GET"},
+      {":path", "/win"},
+      {":scheme", "http"},
+      {":authority", "localhost"},
   };
   auto block = enc.encode(hdrs);
-  frames += make_frame(frame_type::headers,
-                       flags::END_HEADERS | flags::END_STREAM, 1,
-                       std::span<const uint8_t>(block));
+  frames +=
+      make_frame(frame_type::headers, flags::END_HEADERS | flags::END_STREAM, 1,
+                 std::span<const uint8_t>(block));
   asio::write(client, asio::buffer(frames));
 
   hpack_decoder dec;
@@ -3944,11 +4140,11 @@ TEST_CASE("response body respects peer initial window size") {
 
 TEST_CASE("PRIORITY frame with stream 0 triggers GOAWAY") {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "ok");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "ok");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -3958,8 +4154,8 @@ TEST_CASE("PRIORITY frame with stream 0 triggers GOAWAY") {
   std::string init(CLIENT_PREFACE);
   init += make_settings_frame({});
   auto payload = make_priority_payload(1);
-  init += make_frame(frame_type::priority, 0, 0,
-                     std::span<const uint8_t>(payload));
+  init +=
+      make_frame(frame_type::priority, 0, 0, std::span<const uint8_t>(payload));
   asio::write(client, asio::buffer(init));
 
   CHECK(read_until_frame_type(client, frame_type::goaway));
@@ -3968,11 +4164,11 @@ TEST_CASE("PRIORITY frame with stream 0 triggers GOAWAY") {
 
 TEST_CASE("PUSH_PROMISE from client triggers GOAWAY") {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "ok");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "ok");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -3982,7 +4178,10 @@ TEST_CASE("PUSH_PROMISE from client triggers GOAWAY") {
   std::string init(CLIENT_PREFACE);
   init += make_settings_frame({});
   std::vector<uint8_t> payload{
-      0x00, 0x00, 0x00, 0x02,
+      0x00,
+      0x00,
+      0x00,
+      0x02,
   };
   init += make_frame(frame_type::push_promise, flags::END_HEADERS, 1,
                      std::span<const uint8_t>(payload));
@@ -3994,11 +4193,11 @@ TEST_CASE("PUSH_PROMISE from client triggers GOAWAY") {
 
 TEST_CASE("GOAWAY with stream 1 triggers GOAWAY") {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "ok");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "ok");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -4008,8 +4207,8 @@ TEST_CASE("GOAWAY with stream 1 triggers GOAWAY") {
   std::array<uint8_t, 8> payload{};
   std::string init(CLIENT_PREFACE);
   init += make_settings_frame({});
-  init += make_frame(frame_type::goaway, 0, 1,
-                     std::span<const uint8_t>(payload));
+  init +=
+      make_frame(frame_type::goaway, 0, 1, std::span<const uint8_t>(payload));
   asio::write(client, asio::buffer(init));
 
   CHECK(read_until_frame_type(client, frame_type::goaway));
@@ -4018,11 +4217,11 @@ TEST_CASE("GOAWAY with stream 1 triggers GOAWAY") {
 
 TEST_CASE("GOAWAY with short payload triggers GOAWAY") {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "ok");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "ok");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -4032,8 +4231,8 @@ TEST_CASE("GOAWAY with short payload triggers GOAWAY") {
   std::array<uint8_t, 4> payload{};
   std::string init(CLIENT_PREFACE);
   init += make_settings_frame({});
-  init += make_frame(frame_type::goaway, 0, 0,
-                     std::span<const uint8_t>(payload));
+  init +=
+      make_frame(frame_type::goaway, 0, 0, std::span<const uint8_t>(payload));
   asio::write(client, asio::buffer(init));
 
   CHECK(read_until_frame_type(client, frame_type::goaway));
@@ -4042,11 +4241,11 @@ TEST_CASE("GOAWAY with short payload triggers GOAWAY") {
 
 TEST_CASE("request HEADERS priority self-dependency triggers RST_STREAM") {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "ok");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "ok");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -4063,7 +4262,8 @@ TEST_CASE("request HEADERS priority self-dependency triggers RST_STREAM") {
       1, flags::END_HEADERS | flags::END_STREAM | flags::PRIORITY, 1);
   asio::write(client, asio::buffer(frames));
 
-  // RFC 7540 section 5.3.1: self-dependency is a stream error, not connection error.
+  // RFC 7540 section 5.3.1: self-dependency is a stream error, not connection
+  // error.
   CHECK(read_until_frame_type(client, frame_type::rst_stream));
   client.close();
 }
@@ -4074,50 +4274,54 @@ TEST_CASE("request HEADERS priority self-dependency triggers RST_STREAM") {
 
 // Helper: build HEADERS without END_HEADERS (for CONTINUATION tests)
 static std::string build_get_no_end_headers(const std::string& path,
-                                             uint32_t stream_id = 1) {
+                                            uint32_t stream_id = 1) {
   std::string frames(CLIENT_PREFACE);
   frames += make_settings_frame({});
 
   hpack_encoder enc;
   std::vector<header_field> hdrs{
-      {":method", "GET"}, {":path", path},
-      {":scheme", "http"}, {":authority", "localhost"},
+      {":method", "GET"},
+      {":path", path},
+      {":scheme", "http"},
+      {":authority", "localhost"},
   };
   auto block = enc.encode(hdrs);
 
   // HEADERS without END_HEADERS, with END_STREAM
-  frames += make_frame(frame_type::headers,
-                        flags::END_STREAM, stream_id,
-                        std::span<const uint8_t>(block));
+  frames += make_frame(frame_type::headers, flags::END_STREAM, stream_id,
+                       std::span<const uint8_t>(block));
   return frames;
 }
 
 static std::string build_post_headers(const std::string& path,
-                                       uint32_t stream_id = 1,
-                                       bool end_stream = false) {
+                                      uint32_t stream_id = 1,
+                                      bool end_stream = false) {
   std::string frames(CLIENT_PREFACE);
   frames += make_settings_frame({});
 
   hpack_encoder enc;
   std::vector<header_field> hdrs{
-      {":method", "POST"}, {":path", path},
-      {":scheme", "http"}, {":authority", "localhost"},
+      {":method", "POST"},
+      {":path", path},
+      {":scheme", "http"},
+      {":authority", "localhost"},
   };
   auto block = enc.encode(hdrs);
   uint8_t flags_bits = flags::END_HEADERS;
-  if (end_stream) flags_bits |= flags::END_STREAM;
+  if (end_stream)
+    flags_bits |= flags::END_STREAM;
   frames += make_frame(frame_type::headers, flags_bits, stream_id,
-                        std::span<const uint8_t>(block));
+                       std::span<const uint8_t>(block));
   return frames;
 }
 
 TEST_CASE("SETTINGS ACK with payload triggers GOAWAY") {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -4136,11 +4340,11 @@ TEST_CASE("SETTINGS ACK with payload triggers GOAWAY") {
 
 TEST_CASE("SETTINGS invalid max_frame_size triggers GOAWAY") {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -4163,11 +4367,11 @@ TEST_CASE("DATA without END_STREAM yields batched WINDOW_UPDATE frames") {
   // only sends WINDOW_UPDATE when at least half of the initial window (65535/2)
   // has been consumed.  Send enough DATA to cross the threshold.
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -4211,13 +4415,14 @@ TEST_CASE("DATA without END_STREAM yields batched WINDOW_UPDATE frames") {
     auto data_frame = make_frame(frame_type::data, 0, 1, chunk_span);
     std::error_code ec;
     asio::write(client, asio::buffer(data_frame), ec);
-    if (ec) break;
+    if (ec)
+      break;
   }
 
   bool got_conn_window_update = false;
   bool got_stream_window_update = false;
-  for (int i = 0; i < 30 &&
-                  !(got_conn_window_update && got_stream_window_update); ++i) {
+  for (int i = 0;
+       i < 30 && !(got_conn_window_update && got_stream_window_update); ++i) {
     if (!read_exact_with_timeout(
             client, std::span<uint8_t>(hdr_buf.data(), hdr_buf.size()),
             std::chrono::milliseconds(2000))) {
@@ -4235,8 +4440,7 @@ TEST_CASE("DATA without END_STREAM yields batched WINDOW_UPDATE frames") {
     if (hdr.type == frame_type::window_update && hdr.length == 4) {
       uint32_t increment = ((uint32_t(payload[0]) & 0x7f) << 24) |
                            (uint32_t(payload[1]) << 16) |
-                           (uint32_t(payload[2]) << 8) |
-                           uint32_t(payload[3]);
+                           (uint32_t(payload[2]) << 8) | uint32_t(payload[3]);
       if (hdr.stream_id == 0 && increment > 0)
         got_conn_window_update = true;
       if (hdr.stream_id == 1 && increment > 0)
@@ -4251,11 +4455,11 @@ TEST_CASE("DATA without END_STREAM yields batched WINDOW_UPDATE frames") {
 
 TEST_CASE("HEADERS with invalid padding triggers GOAWAY") {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "");
+        co_return;
+      });
 
   asio::io_context client_ioc;
   asio::ip::tcp::socket client(client_ioc);
@@ -4275,11 +4479,11 @@ TEST_CASE("HEADERS with invalid padding triggers GOAWAY") {
 
 TEST_CASE("DATA with invalid padding triggers GOAWAY") {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "");
+        co_return;
+      });
 
   asio::io_context client_ioc;
   asio::ip::tcp::socket client(client_ioc);
@@ -4287,21 +4491,22 @@ TEST_CASE("DATA with invalid padding triggers GOAWAY") {
 
   std::string frames = build_post_headers("/upload", 1, false);
   std::vector<uint8_t> bad_data{0x05, 'x'};
-  frames += make_frame(frame_type::data,
-                       flags::END_STREAM | flags::PADDED, 1, bad_data);
+  frames += make_frame(frame_type::data, flags::END_STREAM | flags::PADDED, 1,
+                       bad_data);
   asio::write(client, asio::buffer(frames));
 
   CHECK(read_until_frame_type(client, frame_type::goaway));
   client.close();
 }
 
-TEST_CASE("nghttp2-inspired request validation: missing :path triggers RST_STREAM") {
+TEST_CASE(
+    "nghttp2-inspired request validation: missing :path triggers RST_STREAM") {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "ok");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "ok");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -4319,13 +4524,15 @@ TEST_CASE("nghttp2-inspired request validation: missing :path triggers RST_STREA
   client.close();
 }
 
-TEST_CASE("nghttp2-inspired request validation: missing :method triggers RST_STREAM") {
+TEST_CASE(
+    "nghttp2-inspired request validation: missing :method triggers "
+    "RST_STREAM") {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "ok");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "ok");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -4343,13 +4550,15 @@ TEST_CASE("nghttp2-inspired request validation: missing :method triggers RST_STR
   client.close();
 }
 
-TEST_CASE("nghttp2-inspired request validation: missing :scheme triggers RST_STREAM") {
+TEST_CASE(
+    "nghttp2-inspired request validation: missing :scheme triggers "
+    "RST_STREAM") {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "ok");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "ok");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -4367,13 +4576,15 @@ TEST_CASE("nghttp2-inspired request validation: missing :scheme triggers RST_STR
   client.close();
 }
 
-TEST_CASE("nghttp2-inspired request validation: connection header triggers RST_STREAM") {
+TEST_CASE(
+    "nghttp2-inspired request validation: connection header triggers "
+    "RST_STREAM") {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "ok");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "ok");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -4381,11 +4592,8 @@ TEST_CASE("nghttp2-inspired request validation: connection header triggers RST_S
   connect_direct(client, port);
 
   std::vector<header_field> hdrs{
-      {":method", "GET"},
-      {":path", "/"},
-      {":scheme", "http"},
-      {":authority", "localhost"},
-      {"connection", "close"},
+      {":method", "GET"},          {":path", "/"},          {":scheme", "http"},
+      {":authority", "localhost"}, {"connection", "close"},
   };
   asio::write(client, asio::buffer(build_request_frames(hdrs)));
 
@@ -4393,13 +4601,15 @@ TEST_CASE("nghttp2-inspired request validation: connection header triggers RST_S
   client.close();
 }
 
-TEST_CASE("nghttp2-inspired request validation: duplicate :path triggers RST_STREAM") {
+TEST_CASE(
+    "nghttp2-inspired request validation: duplicate :path triggers "
+    "RST_STREAM") {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "ok");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "ok");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -4407,11 +4617,8 @@ TEST_CASE("nghttp2-inspired request validation: duplicate :path triggers RST_STR
   connect_direct(client, port);
 
   std::vector<header_field> hdrs{
-      {":method", "GET"},
-      {":path", "/"},
-      {":scheme", "http"},
-      {":authority", "localhost"},
-      {":path", "/"},
+      {":method", "GET"},          {":path", "/"}, {":scheme", "http"},
+      {":authority", "localhost"}, {":path", "/"},
   };
   asio::write(client, asio::buffer(build_request_frames(hdrs)));
 
@@ -4419,13 +4626,15 @@ TEST_CASE("nghttp2-inspired request validation: duplicate :path triggers RST_STR
   client.close();
 }
 
-TEST_CASE("nghttp2-inspired request validation: duplicate :method triggers RST_STREAM") {
+TEST_CASE(
+    "nghttp2-inspired request validation: duplicate :method triggers "
+    "RST_STREAM") {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "ok");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "ok");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -4433,11 +4642,8 @@ TEST_CASE("nghttp2-inspired request validation: duplicate :method triggers RST_S
   connect_direct(client, port);
 
   std::vector<header_field> hdrs{
-      {":method", "GET"},
-      {":path", "/"},
-      {":scheme", "http"},
-      {":authority", "localhost"},
-      {":method", "GET"},
+      {":method", "GET"},          {":path", "/"},     {":scheme", "http"},
+      {":authority", "localhost"}, {":method", "GET"},
   };
   asio::write(client, asio::buffer(build_request_frames(hdrs)));
 
@@ -4445,13 +4651,15 @@ TEST_CASE("nghttp2-inspired request validation: duplicate :method triggers RST_S
   client.close();
 }
 
-TEST_CASE("nghttp2-inspired request validation: duplicate :scheme triggers RST_STREAM") {
+TEST_CASE(
+    "nghttp2-inspired request validation: duplicate :scheme triggers "
+    "RST_STREAM") {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "ok");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "ok");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -4459,11 +4667,8 @@ TEST_CASE("nghttp2-inspired request validation: duplicate :scheme triggers RST_S
   connect_direct(client, port);
 
   std::vector<header_field> hdrs{
-      {":method", "GET"},
-      {":path", "/"},
-      {":scheme", "http"},
-      {":authority", "localhost"},
-      {":scheme", "http"},
+      {":method", "GET"},          {":path", "/"},      {":scheme", "http"},
+      {":authority", "localhost"}, {":scheme", "http"},
   };
   asio::write(client, asio::buffer(build_request_frames(hdrs)));
 
@@ -4471,13 +4676,15 @@ TEST_CASE("nghttp2-inspired request validation: duplicate :scheme triggers RST_S
   client.close();
 }
 
-TEST_CASE("nghttp2-inspired request validation: invalid content-length triggers RST_STREAM") {
+TEST_CASE(
+    "nghttp2-inspired request validation: invalid content-length triggers "
+    "RST_STREAM") {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "ok");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "ok");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -4485,10 +4692,8 @@ TEST_CASE("nghttp2-inspired request validation: invalid content-length triggers 
   connect_direct(client, port);
 
   std::vector<header_field> hdrs{
-      {":method", "POST"},
-      {":path", "/"},
-      {":scheme", "http"},
-      {":authority", "localhost"},
+      {":method", "POST"},      {":path", "/"},
+      {":scheme", "http"},      {":authority", "localhost"},
       {"content-length", "-1"},
   };
   asio::write(client, asio::buffer(build_request_frames(hdrs)));
@@ -4497,13 +4702,15 @@ TEST_CASE("nghttp2-inspired request validation: invalid content-length triggers 
   client.close();
 }
 
-TEST_CASE("nghttp2-inspired request validation: asterisk path with GET triggers RST_STREAM") {
+TEST_CASE(
+    "nghttp2-inspired request validation: asterisk path with GET triggers "
+    "RST_STREAM") {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "ok");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "ok");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -4522,14 +4729,16 @@ TEST_CASE("nghttp2-inspired request validation: asterisk path with GET triggers 
   client.close();
 }
 
-TEST_CASE("nghttp2-inspired request validation: asterisk path with OPTIONS is accepted") {
+TEST_CASE(
+    "nghttp2-inspired request validation: asterisk path with OPTIONS is "
+    "accepted") {
   server_runner srv;
-  srv.launch([](h2_request& req, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(req.method == "OPTIONS" && req.path == "*" ? 200 : 400,
-                             "ok");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request& req, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(
+            req.method == "OPTIONS" && req.path == "*" ? 200 : 400, "ok");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -4550,13 +4759,15 @@ TEST_CASE("nghttp2-inspired request validation: asterisk path with OPTIONS is ac
   client.close();
 }
 
-TEST_CASE("nghttp2-inspired request validation: pseudo header after regular header triggers RST_STREAM") {
+TEST_CASE(
+    "nghttp2-inspired request validation: pseudo header after regular header "
+    "triggers RST_STREAM") {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "ok");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "ok");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -4576,13 +4787,15 @@ TEST_CASE("nghttp2-inspired request validation: pseudo header after regular head
   client.close();
 }
 
-TEST_CASE("nghttp2-inspired request validation: duplicate content-length triggers RST_STREAM") {
+TEST_CASE(
+    "nghttp2-inspired request validation: duplicate content-length triggers "
+    "RST_STREAM") {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "ok");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "ok");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -4590,12 +4803,9 @@ TEST_CASE("nghttp2-inspired request validation: duplicate content-length trigger
   connect_direct(client, port);
 
   std::vector<header_field> hdrs{
-      {":method", "POST"},
-      {":path", "/"},
-      {":scheme", "http"},
-      {":authority", "localhost"},
-      {"content-length", "0"},
-      {"content-length", "0"},
+      {":method", "POST"},     {":path", "/"},
+      {":scheme", "http"},     {":authority", "localhost"},
+      {"content-length", "0"}, {"content-length", "0"},
   };
   asio::write(client, asio::buffer(build_request_frames(hdrs)));
 
@@ -4603,13 +4813,15 @@ TEST_CASE("nghttp2-inspired request validation: duplicate content-length trigger
   client.close();
 }
 
-TEST_CASE("nghttp2-inspired request validation: content-length mismatch triggers RST_STREAM") {
+TEST_CASE(
+    "nghttp2-inspired request validation: content-length mismatch triggers "
+    "RST_STREAM") {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "ok");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "ok");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -4617,11 +4829,8 @@ TEST_CASE("nghttp2-inspired request validation: content-length mismatch triggers
   connect_direct(client, port);
 
   std::vector<header_field> hdrs{
-      {":method", "POST"},
-      {":path", "/upload"},
-      {":scheme", "http"},
-      {":authority", "localhost"},
-      {"content-length", "4"},
+      {":method", "POST"},         {":path", "/upload"},    {":scheme", "http"},
+      {":authority", "localhost"}, {"content-length", "4"},
   };
   asio::write(client, asio::buffer(build_request_frames(hdrs)));
 
@@ -4629,13 +4838,15 @@ TEST_CASE("nghttp2-inspired request validation: content-length mismatch triggers
   client.close();
 }
 
-TEST_CASE("nghttp2-inspired request validation: malformed stream does not tear down sibling stream") {
+TEST_CASE(
+    "nghttp2-inspired request validation: malformed stream does not tear down "
+    "sibling stream") {
   server_runner srv;
-  srv.launch([](h2_request& req, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(req.path == "/ok" ? 200 : 404, "ok");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request& req, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(req.path == "/ok" ? 200 : 404, "ok");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -4645,16 +4856,13 @@ TEST_CASE("nghttp2-inspired request validation: malformed stream does not tear d
   std::string frames(CLIENT_PREFACE);
   frames += make_settings_frame({});
   frames += build_header_frame(
-      {{":method", "GET"},
-       {":scheme", "http"},
-       {":authority", "localhost"}},
+      {{":method", "GET"}, {":scheme", "http"}, {":authority", "localhost"}},
       flags::END_HEADERS | flags::END_STREAM, 1);
-  frames += build_header_frame(
-      {{":method", "GET"},
-       {":path", "/ok"},
-       {":scheme", "http"},
-       {":authority", "localhost"}},
-      flags::END_HEADERS | flags::END_STREAM, 3);
+  frames += build_header_frame({{":method", "GET"},
+                                {":path", "/ok"},
+                                {":scheme", "http"},
+                                {":authority", "localhost"}},
+                               flags::END_HEADERS | flags::END_STREAM, 3);
   asio::write(client, asio::buffer(frames));
 
   bool got_rst_stream1 = false;
@@ -4679,12 +4887,14 @@ TEST_CASE("nghttp2-inspired request validation: malformed stream does not tear d
     if (hdr.type == frame_type::headers && hdr.stream_id == 3) {
       auto decoded = dec.decode(std::span<const uint8_t>(payload));
       for (auto& h : decoded)
-        if (h.name == ":status") status3 = std::stoi(h.value);
+        if (h.name == ":status")
+          status3 = std::stoi(h.value);
       continue;
     }
 
     if (hdr.type == frame_type::data && hdr.stream_id == 3) {
-      body3.append(reinterpret_cast<const char*>(payload.data()), payload.size());
+      body3.append(reinterpret_cast<const char*>(payload.data()),
+                   payload.size());
     }
   }
 
@@ -4697,11 +4907,11 @@ TEST_CASE("nghttp2-inspired request validation: malformed stream does not tear d
 TEST_CASE("CONTINUATION: interleaved DATA frame rejected") {
   // Send HEADERS without END_HEADERS, then a DATA frame -> GOAWAY
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -4713,8 +4923,8 @@ TEST_CASE("CONTINUATION: interleaved DATA frame rejected") {
 
   // Send DATA frame while CONTINUATION is expected
   std::vector<uint8_t> data_payload{0x01, 0x02};
-  asio::write(client, asio::buffer(
-      make_frame(frame_type::data, 0, 1, data_payload)));
+  asio::write(client,
+              asio::buffer(make_frame(frame_type::data, 0, 1, data_payload)));
 
   CHECK(read_until_frame_type(client, frame_type::goaway));
   client.close();
@@ -4722,11 +4932,11 @@ TEST_CASE("CONTINUATION: interleaved DATA frame rejected") {
 
 TEST_CASE("CONTINUATION: different stream CONTINUATION rejected") {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -4738,9 +4948,9 @@ TEST_CASE("CONTINUATION: different stream CONTINUATION rejected") {
 
   // Send CONTINUATION for stream 3 (wrong stream)
   std::vector<uint8_t> empty_block;
-  asio::write(client, asio::buffer(
-      make_frame(frame_type::continuation, flags::END_HEADERS, 3,
-                  empty_block)));
+  asio::write(client,
+              asio::buffer(make_frame(frame_type::continuation,
+                                      flags::END_HEADERS, 3, empty_block)));
 
   CHECK(read_until_frame_type(client, frame_type::goaway));
   client.close();
@@ -4748,33 +4958,36 @@ TEST_CASE("CONTINUATION: different stream CONTINUATION rejected") {
 
 TEST_CASE("CONTINUATION: correct sequence succeeds") {
   server_runner srv;
-  srv.launch([](h2_request& req, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(req.path == "/cont" ? 200 : 404, "cont ok");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request& req, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(req.path == "/cont" ? 200 : 404, "cont ok");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
   asio::ip::tcp::socket client(client_ioc);
   connect_direct(client, port);
 
-  // Build frames: preface + SETTINGS + HEADERS(no END_HEADERS) + CONTINUATION(END_HEADERS)
+  // Build frames: preface + SETTINGS + HEADERS(no END_HEADERS) +
+  // CONTINUATION(END_HEADERS)
   std::string frames(CLIENT_PREFACE);
   frames += make_settings_frame({});
 
   hpack_encoder enc;
   std::vector<header_field> hdrs{
-      {":method", "GET"}, {":path", "/cont"},
-      {":scheme", "http"}, {":authority", "localhost"},
+      {":method", "GET"},
+      {":path", "/cont"},
+      {":scheme", "http"},
+      {":authority", "localhost"},
   };
   auto block = enc.encode(hdrs);
 
   // Split the block: first part in HEADERS, rest in CONTINUATION
   size_t split = block.size() / 2;
   auto part1 = std::span<const uint8_t>(block.data(), split);
-  auto part2 = std::span<const uint8_t>(block.data() + split,
-                                         block.size() - split);
+  auto part2 =
+      std::span<const uint8_t>(block.data() + split, block.size() - split);
 
   frames += make_frame(frame_type::headers, flags::END_STREAM, 1, part1);
   frames += make_frame(frame_type::continuation, flags::END_HEADERS, 1, part2);
@@ -4792,11 +5005,11 @@ TEST_CASE("CONTINUATION: correct sequence succeeds") {
 
 TEST_CASE("RST_STREAM: invalid payload length triggers GOAWAY") {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -4808,8 +5021,8 @@ TEST_CASE("RST_STREAM: invalid payload length triggers GOAWAY") {
 
   // Now send RST_STREAM with wrong payload length (2 bytes instead of 4)
   std::vector<uint8_t> bad_payload{0x00, 0x00};
-  asio::write(client, asio::buffer(
-      make_frame(frame_type::rst_stream, 0, 1, bad_payload)));
+  asio::write(client, asio::buffer(make_frame(frame_type::rst_stream, 0, 1,
+                                              bad_payload)));
 
   bool got_goaway = false;
   std::array<uint8_t, 9> hdr_buf;
@@ -4817,11 +5030,14 @@ TEST_CASE("RST_STREAM: invalid payload length triggers GOAWAY") {
   for (int i = 0; i < 10 && !got_goaway; ++i) {
     std::error_code ec;
     asio::read(client, asio::buffer(hdr_buf), ec);
-    if (ec) break;
+    if (ec)
+      break;
     auto hdr = parse_frame_header(hdr_buf);
     payload.resize(hdr.length);
-    if (hdr.length > 0) asio::read(client, asio::buffer(payload), ec);
-    if (ec) break;
+    if (hdr.length > 0)
+      asio::read(client, asio::buffer(payload), ec);
+    if (ec)
+      break;
 
     if (hdr.type == frame_type::settings && !(hdr.flags & flags::ACK))
       asio::write(client, asio::buffer(make_settings_frame({}, true)));
@@ -4834,11 +5050,11 @@ TEST_CASE("RST_STREAM: invalid payload length triggers GOAWAY") {
 
 TEST_CASE("RST_STREAM: stream_id 0 triggers GOAWAY") {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -4858,7 +5074,8 @@ TEST_CASE("RST_STREAM: stream_id 0 triggers GOAWAY") {
       asio::read(client, asio::buffer(hdr_buf));
       auto hdr = parse_frame_header(hdr_buf);
       payload.resize(hdr.length);
-      if (hdr.length > 0) asio::read(client, asio::buffer(payload));
+      if (hdr.length > 0)
+        asio::read(client, asio::buffer(payload));
       if (hdr.type == frame_type::settings && !(hdr.flags & flags::ACK)) {
         asio::write(client, asio::buffer(make_settings_frame({}, true)));
         break;
@@ -4875,11 +5092,14 @@ TEST_CASE("RST_STREAM: stream_id 0 triggers GOAWAY") {
   for (int i = 0; i < 10 && !got_goaway; ++i) {
     std::error_code ec;
     asio::read(client, asio::buffer(hdr_buf), ec);
-    if (ec) break;
+    if (ec)
+      break;
     auto hdr = parse_frame_header(hdr_buf);
     payload.resize(hdr.length);
-    if (hdr.length > 0) asio::read(client, asio::buffer(payload), ec);
-    if (ec) break;
+    if (hdr.length > 0)
+      asio::read(client, asio::buffer(payload), ec);
+    if (ec)
+      break;
 
     if (hdr.type == frame_type::settings && !(hdr.flags & flags::ACK))
       asio::write(client, asio::buffer(make_settings_frame({}, true)));
@@ -4892,11 +5112,11 @@ TEST_CASE("RST_STREAM: stream_id 0 triggers GOAWAY") {
 
 TEST_CASE("stream ID: non-increasing stream ID triggers GOAWAY") {
   server_runner srv;
-  srv.launch([](h2_request& req, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "ok");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request& req, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "ok");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -4909,19 +5129,21 @@ TEST_CASE("stream ID: non-increasing stream ID triggers GOAWAY") {
 
   hpack_encoder enc;
   std::vector<header_field> hdrs{
-      {":method", "GET"}, {":path", "/"},
-      {":scheme", "http"}, {":authority", "localhost"},
+      {":method", "GET"},
+      {":path", "/"},
+      {":scheme", "http"},
+      {":authority", "localhost"},
   };
   auto block = enc.encode(hdrs);
   // Stream 3 first (valid)
-  frames += make_frame(frame_type::headers,
-                        flags::END_HEADERS | flags::END_STREAM, 3,
-                        std::span<const uint8_t>(block));
+  frames +=
+      make_frame(frame_type::headers, flags::END_HEADERS | flags::END_STREAM, 3,
+                 std::span<const uint8_t>(block));
   // Stream 1 second (invalid: 1 < 3)
   block = enc.encode(hdrs);
-  frames += make_frame(frame_type::headers,
-                        flags::END_HEADERS | flags::END_STREAM, 1,
-                        std::span<const uint8_t>(block));
+  frames +=
+      make_frame(frame_type::headers, flags::END_HEADERS | flags::END_STREAM, 1,
+                 std::span<const uint8_t>(block));
   asio::write(client, asio::buffer(frames));
 
   bool got_goaway = false;
@@ -4930,11 +5152,14 @@ TEST_CASE("stream ID: non-increasing stream ID triggers GOAWAY") {
   for (int i = 0; i < 15 && !got_goaway; ++i) {
     std::error_code ec;
     asio::read(client, asio::buffer(hdr_buf), ec);
-    if (ec) break;
+    if (ec)
+      break;
     auto hdr = parse_frame_header(hdr_buf);
     payload.resize(hdr.length);
-    if (hdr.length > 0) asio::read(client, asio::buffer(payload), ec);
-    if (ec) break;
+    if (hdr.length > 0)
+      asio::read(client, asio::buffer(payload), ec);
+    if (ec)
+      break;
 
     if (hdr.type == frame_type::settings && !(hdr.flags & flags::ACK))
       asio::write(client, asio::buffer(make_settings_frame({}, true)));
@@ -4948,12 +5173,13 @@ TEST_CASE("stream ID: non-increasing stream ID triggers GOAWAY") {
 TEST_CASE("HEADERS + DATA with END_STREAM dispatches correctly") {
   server_runner srv;
   std::string received_body;
-  srv.launch([&received_body](h2_request& req, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    received_body = req.body;
-    resp.set_status_and_body(200, "got it");
-    co_return;
-  });
+  srv.launch(
+      [&received_body](h2_request& req,
+                       h2_response& resp) -> async_simple::coro::Lazy<void> {
+        received_body = req.body;
+        resp.set_status_and_body(200, "got it");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -4966,12 +5192,14 @@ TEST_CASE("HEADERS + DATA with END_STREAM dispatches correctly") {
 
   hpack_encoder enc;
   std::vector<header_field> hdrs{
-      {":method", "POST"}, {":path", "/upload"},
-      {":scheme", "http"}, {":authority", "localhost"},
+      {":method", "POST"},
+      {":path", "/upload"},
+      {":scheme", "http"},
+      {":authority", "localhost"},
   };
   auto block = enc.encode(hdrs);
   frames += make_frame(frame_type::headers, flags::END_HEADERS, 1,
-                        std::span<const uint8_t>(block));
+                       std::span<const uint8_t>(block));
   std::string body_data = "hello world";
   auto body_span = std::span<const uint8_t>(
       reinterpret_cast<const uint8_t*>(body_data.data()), body_data.size());
@@ -4985,11 +5213,12 @@ TEST_CASE("HEADERS + DATA with END_STREAM dispatches correctly") {
   client.close();
 }
 
-TEST_CASE("response header block is fragmented into CONTINUATION when oversized") {
+TEST_CASE(
+    "response header block is fragmented into CONTINUATION when oversized") {
   server_runner srv;
   auto big_value = make_large_header_value(40000);
-  srv.launch([big_value](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
+  srv.launch([big_value](h2_request&,
+                         h2_response& resp) -> async_simple::coro::Lazy<void> {
     resp.add_header("x-big", big_value);
     resp.set_status_and_body(200, "ok");
     co_return;
@@ -4999,7 +5228,8 @@ TEST_CASE("response header block is fragmented into CONTINUATION when oversized"
   asio::io_context client_ioc;
   asio::ip::tcp::socket client(client_ioc);
   connect_direct(client, port);
-  asio::write(client, asio::buffer(build_get_frames("/large-response-headers")));
+  asio::write(client,
+              asio::buffer(build_get_frames("/large-response-headers")));
 
   hpack_decoder dec;
   std::vector<uint8_t> header_block;
@@ -5035,17 +5265,21 @@ TEST_CASE("response header block is fragmented into CONTINUATION when oversized"
       if (hdr.flags & flags::END_HEADERS) {
         auto decoded = dec.decode(std::span<const uint8_t>(header_block));
         for (auto& h : decoded)
-          if (h.name == ":status") status = std::stoi(h.value);
+          if (h.name == ":status")
+            status = std::stoi(h.value);
         header_block.clear();
         header_block_complete = true;
-        if (header_end_stream) break;
+        if (header_end_stream)
+          break;
       }
       continue;
     }
 
     if (hdr.type == frame_type::data && hdr.stream_id == 1) {
-      body.append(reinterpret_cast<const char*>(payload.data()), payload.size());
-      if (hdr.flags & flags::END_STREAM) break;
+      body.append(reinterpret_cast<const char*>(payload.data()),
+                  payload.size());
+      if (hdr.flags & flags::END_STREAM)
+        break;
     }
   }
 
@@ -5057,55 +5291,60 @@ TEST_CASE("response header block is fragmented into CONTINUATION when oversized"
   client.close();
 }
 
-TEST_CASE("client request header block is fragmented into CONTINUATION when oversized") {
+TEST_CASE(
+    "client request header block is fragmented into CONTINUATION when "
+    "oversized") {
   auto big_value = make_large_header_value(40000);
   bool saw_continuation = false;
   std::string received_big_header;
 
-  raw_h2_server_runner srv(
-      [&saw_continuation, &received_big_header](asio::ip::tcp::socket& sock) {
-        if (!read_client_preface_and_settings(sock)) return;
+  raw_h2_server_runner srv([&saw_continuation,
+                            &received_big_header](asio::ip::tcp::socket& sock) {
+    if (!read_client_preface_and_settings(sock))
+      return;
 
-        std::error_code ec;
-        asio::write(sock, asio::buffer(make_settings_frame({})), ec);
-        if (ec) return;
+    std::error_code ec;
+    asio::write(sock, asio::buffer(make_settings_frame({})), ec);
+    if (ec)
+      return;
 
-        frame_header hdr{};
-        std::vector<uint8_t> payload;
-        std::vector<uint8_t> header_block;
-        for (int i = 0; i < 64; ++i) {
-          if (!read_raw_frame(sock, hdr, payload)) return;
-          if (hdr.type == frame_type::settings ||
-              hdr.type == frame_type::window_update) {
-            continue;
-          }
-          if (hdr.type == frame_type::headers && hdr.stream_id == 1) {
-            header_block.insert(header_block.end(), payload.begin(), payload.end());
-            if (hdr.flags & flags::END_HEADERS)
-              break;
-            continue;
-          }
-          if (hdr.type == frame_type::continuation && hdr.stream_id == 1) {
-            saw_continuation = true;
-            header_block.insert(header_block.end(), payload.begin(), payload.end());
-            if (hdr.flags & flags::END_HEADERS)
-              break;
-          }
-        }
+    frame_header hdr{};
+    std::vector<uint8_t> payload;
+    std::vector<uint8_t> header_block;
+    for (int i = 0; i < 64; ++i) {
+      if (!read_raw_frame(sock, hdr, payload))
+        return;
+      if (hdr.type == frame_type::settings ||
+          hdr.type == frame_type::window_update) {
+        continue;
+      }
+      if (hdr.type == frame_type::headers && hdr.stream_id == 1) {
+        header_block.insert(header_block.end(), payload.begin(), payload.end());
+        if (hdr.flags & flags::END_HEADERS)
+          break;
+        continue;
+      }
+      if (hdr.type == frame_type::continuation && hdr.stream_id == 1) {
+        saw_continuation = true;
+        header_block.insert(header_block.end(), payload.begin(), payload.end());
+        if (hdr.flags & flags::END_HEADERS)
+          break;
+      }
+    }
 
-        hpack_decoder dec;
-        auto decoded = dec.decode(std::span<const uint8_t>(header_block));
-        for (auto& h : decoded) {
-          if (h.name == "x-big")
-            received_big_header = h.value;
-        }
+    hpack_decoder dec;
+    auto decoded = dec.decode(std::span<const uint8_t>(header_block));
+    for (auto& h : decoded) {
+      if (h.name == "x-big")
+        received_big_header = h.value;
+    }
 
-        auto response = build_header_frame({{":status", "200"}},
-                                           flags::END_HEADERS | flags::END_STREAM);
-        asio::write(sock, asio::buffer(response), ec);
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        sock.close(ec);
-      });
+    auto response = build_header_frame({{":status", "200"}},
+                                       flags::END_HEADERS | flags::END_STREAM);
+    asio::write(sock, asio::buffer(response), ec);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    sock.close(ec);
+  });
 
   ioc_runner runner;
   coro_http2_client client(runner.exec.get());
@@ -5116,7 +5355,8 @@ TEST_CASE("client request header block is fragmented into CONTINUATION when over
   h2_client_request req;
   req.path = "/large-request-headers";
   req.headers.push_back({"x-big", big_value});
-  auto resp = async_simple::coro::syncAwait(client.async_request(std::move(req)));
+  auto resp =
+      async_simple::coro::syncAwait(client.async_request(std::move(req)));
 
   CHECK(!resp.net_err);
   CHECK(resp.status_code == 200);
@@ -5130,8 +5370,9 @@ TEST_CASE("request trailers are preserved and dispatch succeeds") {
   server_runner srv;
   std::string received_body;
   std::string received_trailer;
-  srv.launch([&received_body, &received_trailer](h2_request& req, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
+  srv.launch([&received_body, &received_trailer](
+                 h2_request& req,
+                 h2_response& resp) -> async_simple::coro::Lazy<void> {
     received_body = req.body;
     for (auto& hf : req.trailers) {
       if (hf.name == "x-check")
@@ -5148,13 +5389,12 @@ TEST_CASE("request trailers are preserved and dispatch succeeds") {
 
   std::string frames(CLIENT_PREFACE);
   frames += make_settings_frame({});
-  frames += build_header_frame(
-      {{":method", "POST"},
-       {":path", "/trailers"},
-       {":scheme", "http"},
-       {":authority", "localhost"},
-       {"content-length", "3"}},
-      flags::END_HEADERS, 1);
+  frames += build_header_frame({{":method", "POST"},
+                                {":path", "/trailers"},
+                                {":scheme", "http"},
+                                {":authority", "localhost"},
+                                {"content-length", "3"}},
+                               flags::END_HEADERS, 1);
 
   std::string body_data = "hey";
   auto body_span = std::span<const uint8_t>(
@@ -5173,13 +5413,16 @@ TEST_CASE("request trailers are preserved and dispatch succeeds") {
 }
 
 #ifdef CINATRA_ENABLE_SSL
-TEST_CASE("test_http2_required_server/client: request trailers are emitted after body") {
+TEST_CASE(
+    "test_http2_required_server/client: request trailers are emitted after "
+    "body") {
   ioc_runner runner;
   test_http2_required_server srv(runner.ioc, 0);
   srv.init_ssl(test_tls_cert_path(), test_tls_key_path(), "test");
   std::string received_body;
   std::string received_trailer;
-  srv.set_http_handler<cinatra::POST>("/trailers",
+  srv.set_http_handler<cinatra::POST>(
+      "/trailers",
       [&received_body, &received_trailer](h2_request& req, h2_response& resp) {
         received_body = req.body;
         for (auto& hf : req.trailers) {
@@ -5203,7 +5446,8 @@ TEST_CASE("test_http2_required_server/client: request trailers are emitted after
   req.path = "/trailers";
   req.body = "hey";
   req.add_trailer("x-check", "ok");
-  auto resp = async_simple::coro::syncAwait(client.async_request(std::move(req)));
+  auto resp =
+      async_simple::coro::syncAwait(client.async_request(std::move(req)));
 
   CHECK(!resp.net_err);
   CHECK(resp.status_code == 200);
@@ -5215,13 +5459,16 @@ TEST_CASE("test_http2_required_server/client: request trailers are emitted after
   srv.stop();
 }
 
-TEST_CASE("test_http2_required_server/client: request trailers can terminate an empty body") {
+TEST_CASE(
+    "test_http2_required_server/client: request trailers can terminate an "
+    "empty body") {
   ioc_runner runner;
   test_http2_required_server srv(runner.ioc, 0);
   srv.init_ssl(test_tls_cert_path(), test_tls_key_path(), "test");
   std::string received_body;
   std::string received_trailer;
-  srv.set_http_handler<cinatra::POST>("/empty-trailers",
+  srv.set_http_handler<cinatra::POST>(
+      "/empty-trailers",
       [&received_body, &received_trailer](h2_request& req, h2_response& resp) {
         received_body = req.body;
         for (auto& hf : req.trailers) {
@@ -5244,7 +5491,8 @@ TEST_CASE("test_http2_required_server/client: request trailers can terminate an 
   req.method = "POST";
   req.path = "/empty-trailers";
   req.add_trailer("x-check", "empty");
-  auto resp = async_simple::coro::syncAwait(client.async_request(std::move(req)));
+  auto resp =
+      async_simple::coro::syncAwait(client.async_request(std::move(req)));
 
   CHECK(!resp.net_err);
   CHECK(resp.status_code == 200);
@@ -5259,20 +5507,23 @@ TEST_CASE("test_http2_required_server/client: request trailers can terminate an 
 
 TEST_CASE("response trailers are preserved by client") {
   raw_h2_server_runner srv([](asio::ip::tcp::socket& sock) {
-    if (!read_client_preface_and_settings(sock)) return;
+    if (!read_client_preface_and_settings(sock))
+      return;
 
     std::error_code ec;
     asio::write(sock, asio::buffer(make_settings_frame({})), ec);
-    if (ec) return;
-    if (!wait_for_client_request_headers(sock)) return;
+    if (ec)
+      return;
+    if (!wait_for_client_request_headers(sock))
+      return;
 
     std::string frames;
     frames += build_header_frame({{":status", "200"}}, flags::END_HEADERS, 1);
     std::string body = "abc";
     frames += make_frame(
         frame_type::data, 0, 1,
-        std::span<const uint8_t>(
-            reinterpret_cast<const uint8_t*>(body.data()), body.size()));
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(body.data()),
+                                 body.size()));
     frames += build_header_frame({{"x-finished", "yes"}},
                                  flags::END_HEADERS | flags::END_STREAM, 1);
     asio::write(sock, asio::buffer(frames), ec);
@@ -5298,15 +5549,17 @@ TEST_CASE("response trailers are preserved by client") {
 }
 
 #ifdef CINATRA_ENABLE_SSL
-TEST_CASE("test_http2_required_server/client: response trailers are emitted after body") {
+TEST_CASE(
+    "test_http2_required_server/client: response trailers are emitted after "
+    "body") {
   ioc_runner runner;
   test_http2_required_server srv(runner.ioc, 0);
   srv.init_ssl(test_tls_cert_path(), test_tls_key_path(), "test");
   srv.set_http_handler<cinatra::GET>("/trailers",
-      [](h2_request&, h2_response& resp) {
-        resp.set_status_and_body(200, "abc");
-        resp.add_trailer("x-finished", "yes");
-      });
+                                     [](h2_request&, h2_response& resp) {
+                                       resp.set_status_and_body(200, "abc");
+                                       resp.add_trailer("x-finished", "yes");
+                                     });
   uint16_t port = srv.start(*runner.exec);
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
@@ -5327,15 +5580,17 @@ TEST_CASE("test_http2_required_server/client: response trailers are emitted afte
   srv.stop();
 }
 
-TEST_CASE("test_http2_required_server/client: response trailers can terminate an empty body") {
+TEST_CASE(
+    "test_http2_required_server/client: response trailers can terminate an "
+    "empty body") {
   ioc_runner runner;
   test_http2_required_server srv(runner.ioc, 0);
   srv.init_ssl(test_tls_cert_path(), test_tls_key_path(), "test");
   srv.set_http_handler<cinatra::GET>("/empty-trailers",
-      [](h2_request&, h2_response& resp) {
-        resp.status_code = 204;
-        resp.add_trailer("x-finished", "empty");
-      });
+                                     [](h2_request&, h2_response& resp) {
+                                       resp.status_code = 204;
+                                       resp.add_trailer("x-finished", "empty");
+                                     });
   uint16_t port = srv.start(*runner.exec);
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
@@ -5344,7 +5599,8 @@ TEST_CASE("test_http2_required_server/client: response trailers can terminate an
       client.connect("127.0.0.1", std::to_string(port), "https"));
   REQUIRE(!ec);
 
-  auto resp = async_simple::coro::syncAwait(client.async_get("/empty-trailers"));
+  auto resp =
+      async_simple::coro::syncAwait(client.async_get("/empty-trailers"));
   CHECK(!resp.net_err);
   CHECK(resp.status_code == 204);
   CHECK(resp.body.empty());
@@ -5356,15 +5612,17 @@ TEST_CASE("test_http2_required_server/client: response trailers can terminate an
   srv.stop();
 }
 
-TEST_CASE("test_http2_required_server/client: explicit response content-length is not duplicated") {
+TEST_CASE(
+    "test_http2_required_server/client: explicit response content-length is "
+    "not duplicated") {
   ioc_runner runner;
   test_http2_required_server srv(runner.ioc, 0);
   srv.init_ssl(test_tls_cert_path(), test_tls_key_path(), "test");
   srv.set_http_handler<cinatra::GET>("/length",
-      [](h2_request&, h2_response& resp) {
-        resp.add_header("content-length", "5");
-        resp.set_status_and_body(200, "hello");
-      });
+                                     [](h2_request&, h2_response& resp) {
+                                       resp.add_header("content-length", "5");
+                                       resp.set_status_and_body(200, "hello");
+                                     });
   uint16_t port = srv.start(*runner.exec);
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
@@ -5387,20 +5645,24 @@ TEST_CASE("test_http2_required_server/client: explicit response content-length i
 }
 #endif
 
-TEST_CASE("coro_http2_client: peer max header list size rejects oversized request headers locally") {
+TEST_CASE(
+    "coro_http2_client: peer max header list size rejects oversized request "
+    "headers locally") {
   std::atomic<bool> saw_request_headers = false;
   raw_h2_server_runner srv([&saw_request_headers](asio::ip::tcp::socket& sock) {
-    if (!read_client_preface_and_settings(sock)) return;
+    if (!read_client_preface_and_settings(sock))
+      return;
 
     std::array<settings_entry, 1> settings{
         settings_entry{settings_param::max_header_list_size, 256},
     };
     std::error_code ec;
     asio::write(sock, asio::buffer(make_settings_frame(settings)), ec);
-    if (ec) return;
+    if (ec)
+      return;
 
-    saw_request_headers = saw_client_request_headers_within(
-        sock, std::chrono::milliseconds(200));
+    saw_request_headers =
+        saw_client_request_headers_within(sock, std::chrono::milliseconds(200));
     sock.close(ec);
   });
 
@@ -5413,7 +5675,8 @@ TEST_CASE("coro_http2_client: peer max header list size rejects oversized reques
   h2_client_request req;
   req.path = "/too-large";
   req.add_header("x-large", std::string(256, 'a'));
-  auto resp = async_simple::coro::syncAwait(client.async_request(std::move(req)));
+  auto resp =
+      async_simple::coro::syncAwait(client.async_request(std::move(req)));
 
   CHECK(resp.net_err == std::make_error_code(std::errc::message_size));
   CHECK(!saw_request_headers.load());
@@ -5421,20 +5684,24 @@ TEST_CASE("coro_http2_client: peer max header list size rejects oversized reques
   srv.stop();
 }
 
-TEST_CASE("coro_http2_client: peer max header list size rejects oversized request trailers locally") {
+TEST_CASE(
+    "coro_http2_client: peer max header list size rejects oversized request "
+    "trailers locally") {
   std::atomic<bool> saw_request_headers = false;
   raw_h2_server_runner srv([&saw_request_headers](asio::ip::tcp::socket& sock) {
-    if (!read_client_preface_and_settings(sock)) return;
+    if (!read_client_preface_and_settings(sock))
+      return;
 
     std::array<settings_entry, 1> settings{
         settings_entry{settings_param::max_header_list_size, 256},
     };
     std::error_code ec;
     asio::write(sock, asio::buffer(make_settings_frame(settings)), ec);
-    if (ec) return;
+    if (ec)
+      return;
 
-    saw_request_headers = saw_client_request_headers_within(
-        sock, std::chrono::milliseconds(200));
+    saw_request_headers =
+        saw_client_request_headers_within(sock, std::chrono::milliseconds(200));
     sock.close(ec);
   });
 
@@ -5448,7 +5715,8 @@ TEST_CASE("coro_http2_client: peer max header list size rejects oversized reques
   req.method = "POST";
   req.path = "/too-large-trailer";
   req.add_trailer("x-large", std::string(256, 'a'));
-  auto resp = async_simple::coro::syncAwait(client.async_request(std::move(req)));
+  auto resp =
+      async_simple::coro::syncAwait(client.async_request(std::move(req)));
 
   CHECK(resp.net_err == std::make_error_code(std::errc::message_size));
   CHECK(!saw_request_headers.load());
@@ -5456,15 +5724,17 @@ TEST_CASE("coro_http2_client: peer max header list size rejects oversized reques
   srv.stop();
 }
 
-TEST_CASE("test_http2_required_server: peer max header list size rejects oversized response headers locally" *
-          doctest::skip()) {
+TEST_CASE(
+    "test_http2_required_server: peer max header list size rejects oversized "
+    "response headers locally" *
+    doctest::skip()) {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.add_header("x-large", std::string(256, 'a'));
-    resp.set_status_and_body(200, "unused");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.add_header("x-large", std::string(256, 'a'));
+        resp.set_status_and_body(200, "unused");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -5476,27 +5746,28 @@ TEST_CASE("test_http2_required_server: peer max header list size rejects oversiz
       settings_entry{settings_param::max_header_list_size, 128},
   };
   frames += make_settings_frame(settings);
-  frames += build_header_frame(
-      {{":method", "GET"},
-       {":path", "/too-large"},
-       {":scheme", "http"},
-       {":authority", "localhost"}},
-      flags::END_HEADERS | flags::END_STREAM, 1);
+  frames += build_header_frame({{":method", "GET"},
+                                {":path", "/too-large"},
+                                {":scheme", "http"},
+                                {":authority", "localhost"}},
+                               flags::END_HEADERS | flags::END_STREAM, 1);
   asio::write(client, asio::buffer(frames));
 
   CHECK(read_until_frame_type_on_stream(client, frame_type::rst_stream, 1));
   client.close();
 }
 
-TEST_CASE("test_http2_required_server: peer max header list size rejects oversized response trailers locally" *
-          doctest::skip()) {
+TEST_CASE(
+    "test_http2_required_server: peer max header list size rejects oversized "
+    "response trailers locally" *
+    doctest::skip()) {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "unused");
-    resp.add_trailer("x-large", std::string(256, 'a'));
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "unused");
+        resp.add_trailer("x-large", std::string(256, 'a'));
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -5508,12 +5779,11 @@ TEST_CASE("test_http2_required_server: peer max header list size rejects oversiz
       settings_entry{settings_param::max_header_list_size, 128},
   };
   frames += make_settings_frame(settings);
-  frames += build_header_frame(
-      {{":method", "GET"},
-       {":path", "/too-large-trailer"},
-       {":scheme", "http"},
-       {":authority", "localhost"}},
-      flags::END_HEADERS | flags::END_STREAM, 1);
+  frames += build_header_frame({{":method", "GET"},
+                                {":path", "/too-large-trailer"},
+                                {":scheme", "http"},
+                                {":authority", "localhost"}},
+                               flags::END_HEADERS | flags::END_STREAM, 1);
   asio::write(client, asio::buffer(frames));
 
   CHECK(read_until_frame_type_on_stream(client, frame_type::rst_stream, 1));
@@ -5522,12 +5792,12 @@ TEST_CASE("test_http2_required_server: peer max header list size rejects oversiz
 
 TEST_CASE("nghttp2-inspired request validation: te trailers is accepted") {
   server_runner srv;
-  srv.launch([](h2_request& req, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(req.get_header("te") == "trailers" ? 200 : 400,
-                             "ok");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request& req, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(req.get_header("te") == "trailers" ? 200 : 400,
+                                 "ok");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -5535,11 +5805,8 @@ TEST_CASE("nghttp2-inspired request validation: te trailers is accepted") {
   connect_direct(client, port);
 
   std::vector<header_field> hdrs{
-      {":method", "GET"},
-      {":path", "/"},
-      {":scheme", "http"},
-      {":authority", "localhost"},
-      {"te", "trailers"},
+      {":method", "GET"},          {":path", "/"},     {":scheme", "http"},
+      {":authority", "localhost"}, {"te", "trailers"},
   };
   asio::write(client, asio::buffer(build_request_frames(hdrs)));
 
@@ -5549,13 +5816,15 @@ TEST_CASE("nghttp2-inspired request validation: te trailers is accepted") {
   client.close();
 }
 
-TEST_CASE("nghttp2-inspired request validation: te other than trailers triggers RST_STREAM") {
+TEST_CASE(
+    "nghttp2-inspired request validation: te other than trailers triggers "
+    "RST_STREAM") {
   server_runner srv;
-  srv.launch([](h2_request&, h2_response& resp)
-                 -> async_simple::coro::Lazy<void> {
-    resp.set_status_and_body(200, "ok");
-    co_return;
-  });
+  srv.launch(
+      [](h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_body(200, "ok");
+        co_return;
+      });
   uint16_t port = srv.port();
 
   asio::io_context client_ioc;
@@ -5563,11 +5832,8 @@ TEST_CASE("nghttp2-inspired request validation: te other than trailers triggers 
   connect_direct(client, port);
 
   std::vector<header_field> hdrs{
-      {":method", "GET"},
-      {":path", "/"},
-      {":scheme", "http"},
-      {":authority", "localhost"},
-      {"te", "gzip"},
+      {":method", "GET"},          {":path", "/"}, {":scheme", "http"},
+      {":authority", "localhost"}, {"te", "gzip"},
   };
   asio::write(client, asio::buffer(build_request_frames(hdrs)));
 
@@ -5575,7 +5841,9 @@ TEST_CASE("nghttp2-inspired request validation: te other than trailers triggers 
   client.close();
 }
 
-TEST_CASE("nghttp2-inspired client validation: transfer-encoding header is rejected") {
+TEST_CASE(
+    "nghttp2-inspired client validation: transfer-encoding header is "
+    "rejected") {
   auto resp = run_client_with_raw_response(
       build_header_frame({{":status", "200"}, {"transfer-encoding", "chunked"}},
                          flags::END_HEADERS | flags::END_STREAM));
