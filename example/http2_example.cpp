@@ -32,7 +32,8 @@ int main() {
   std::this_thread::sleep_for(50ms);
 
   cinatra::coro_http_client client;
-  auto url = std::string("https://127.0.0.1:") + std::to_string(port) + "/hello";
+  auto url =
+      std::string("https://127.0.0.1:") + std::to_string(port) + "/hello";
   auto resp = async_simple::coro::syncAwait(client.async_get(std::move(url)));
   if (resp.net_err) {
     std::cerr << "request failed: " << resp.net_err.message() << '\n';

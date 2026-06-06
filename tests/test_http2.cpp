@@ -704,7 +704,7 @@ struct server_runner {
         conn = active_conn;
       }
       if (conn) {
-        conn->force_close();
+        conn->close();
         break;
       }
       if (!conn_thread.joinable())
@@ -769,7 +769,7 @@ struct ioc_runner {
     }
     for (auto& conn : conns_to_close) {
       if (conn)
-        conn->force_close();
+        conn->close();
     }
 
     for (auto& worker : workers) {
@@ -1223,7 +1223,7 @@ static uint16_t start_h2_server(ioc_runner& runner, h2_handler handler) {
           runner.http2_connections.push_back(conn);
         }
         if (runner.stopping.load())
-          conn->force_close();
+          conn->close();
         async_simple::coro::syncAwait(conn->start().via(exec_ptr));
       });
 
