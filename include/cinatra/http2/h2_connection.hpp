@@ -421,31 +421,44 @@ class coro_http2_connection
     lifetime_guard_ = shared_from_this();
     if (executor_ == nullptr)
       executor_ = co_await async_simple::CurrentExecutor{};
+    auto finish_before_return = [this]() -> async_simple::coro::Lazy<void> {
+      close_send_waiters();
+      flush_pending_dispatches();
+      co_await wait_for_dispatches();
+      cleanup_done_streams();
+    };
     bool sent_server_settings = false;
     bool startup_preface_consumed = false;
 #ifdef CINATRA_ENABLE_SSL
     if (use_ssl_) {
       auto* ssl_stream = active_ssl_stream();
-      if (ssl_stream == nullptr)
+      if (ssl_stream == nullptr) {
+        co_await finish_before_return();
         co_return;
+      }
       if (!ssl_handshake_done_) {
         auto ec = co_await coro_io::async_handshake(
             ssl_stream_, asio::ssl::stream_base::server);
         if (ec || !selected_alpn_is_h2(ssl_stream->native_handle())) {
           force_close();
+          co_await finish_before_return();
           co_return;
         }
         ssl_handshake_done_ = true;
       }
-      if (!co_await read_preface())
+      if (!co_await read_preface()) {
+        co_await finish_before_return();
         co_return;
+      }
       startup_preface_consumed = true;
     }
 #endif
     if (!startup_preface_consumed) {
       auto startup = co_await handle_plaintext_startup();
-      if (startup == startup_mode::failed)
+      if (startup == startup_mode::failed) {
+        co_await finish_before_return();
         co_return;
+      }
       if (startup == startup_mode::h2c_upgrade) {
         std::array<settings_entry, 5> srv_settings{
             settings_entry{settings_param::header_table_size, 4096},
@@ -461,10 +474,13 @@ class coro_http2_connection
         sent_server_settings = true;
         if (pending_upgrade_stream_id_ != 0 &&
             !start_stream_dispatch(pending_upgrade_stream_id_)) {
+          co_await finish_before_return();
           co_return;
         }
-        if (!co_await read_preface())
+        if (!co_await read_preface()) {
+          co_await finish_before_return();
           co_return;
+        }
       }
     }
 
@@ -479,8 +495,10 @@ class coro_http2_connection
         settings_entry{settings_param::enable_connect_protocol,
                        enable_connect_protocol_ ? 1u : 0u}};
     if (!sent_server_settings &&
-        !co_await write_frame(make_settings_frame(srv_settings)))
+        !co_await write_frame(make_settings_frame(srv_settings))) {
+      co_await finish_before_return();
       co_return;
+    }
 
     // Single read loop: read one frame, handle inline, repeat
     std::array<uint8_t, 9> hdr_buf;
@@ -495,8 +513,10 @@ class coro_http2_connection
       {
         auto buf = asio::buffer(hdr_buf);
         auto [ec, n] = co_await read_from_peer(buf, 9);
-        if (ec || n != 9)
+        if (ec || n != 9) {
+          co_await finish_before_return();
           co_return;
+        }
       }
 
       auto hdr = parse_frame_header(hdr_buf);
@@ -508,6 +528,7 @@ class coro_http2_connection
           std::error_code ignored;
           active_socket().shutdown(asio::ip::tcp::socket::shutdown_send,
                                    ignored);
+          co_await finish_before_return();
           co_return;
         }
       }
@@ -516,6 +537,7 @@ class coro_http2_connection
             make_goaway(last_stream_id_, h2_error_code::frame_size_error));
         std::error_code ignored;
         active_socket().shutdown(asio::ip::tcp::socket::shutdown_send, ignored);
+        co_await finish_before_return();
         co_return;
       }
 
@@ -524,8 +546,10 @@ class coro_http2_connection
       if (hdr.length > 0) {
         auto buf = asio::buffer(payload_buf_);
         auto [ec, n] = co_await read_from_peer(buf, hdr.length);
-        if (ec || n != hdr.length)
+        if (ec || n != hdr.length) {
+          co_await finish_before_return();
           co_return;
+        }
       }
 
       if (input_idle_before_read) {
@@ -538,6 +562,7 @@ class coro_http2_connection
         // Graceful TCP shutdown so GOAWAY reaches the peer before close.
         std::error_code ignored;
         active_socket().shutdown(asio::ip::tcp::socket::shutdown_send, ignored);
+        co_await finish_before_return();
         co_return;
       }
       cleanup_done_streams();
@@ -1599,7 +1624,14 @@ class coro_http2_connection
     pending_dispatch_streams_.clear();
     auto self = shared_from_this();
     for (auto stream_id : pending) {
+      self->active_dispatches_.fetch_add(1, std::memory_order_acq_rel);
       [self, stream_id]() -> async_simple::coro::Lazy<void> {
+        struct dispatch_guard {
+          std::shared_ptr<coro_http2_connection> self;
+          ~dispatch_guard() {
+            self->active_dispatches_.fetch_sub(1, std::memory_order_acq_rel);
+          }
+        } guard{self};
         co_await self->dispatch_stream(stream_id);
       }()
                                  .via(self->executor_)
@@ -1739,8 +1771,11 @@ class coro_http2_connection
       // being hidden behind a normal response frame.
       co_await async_simple::coro::sleep(executor_,
                                          std::chrono::milliseconds(25));
-      if (connection_closed_.load() || st->state == stream_lifecycle::closed)
+      if (connection_closed_.load() || st->state == stream_lifecycle::closed) {
+        st->dispatch_done = true;
+        pending_cleanup_ = true;
         co_return;
+      }
     }
 
     bool ok = false;
@@ -2430,6 +2465,20 @@ class coro_http2_connection
     send_window_cv_.notifyAll();
   }
 
+  async_simple::coro::Lazy<void> wait_for_dispatches() {
+    if (executor_ == nullptr)
+      co_return;
+
+    constexpr auto drain_step = std::chrono::milliseconds(5);
+    constexpr auto drain_timeout = std::chrono::seconds(2);
+    auto deadline = std::chrono::steady_clock::now() + drain_timeout;
+    while (active_dispatches_.load(std::memory_order_acquire) != 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+      co_await async_simple::coro::sleep(executor_, drain_step);
+      cleanup_done_streams();
+    }
+  }
+
   // Called from the read loop to erase streams that dispatch_stream has
   // finished processing.  This keeps streams_ modifications on the read
   // coroutine, eliminating data races.
@@ -2613,6 +2662,7 @@ class coro_http2_connection
   int32_t connection_recv_window_ = static_cast<int32_t>(DEFAULT_WINDOW_SIZE);
   uint32_t connection_recv_pending_ = 0;
   std::atomic<bool> connection_closed_ = false;
+  std::atomic<uint32_t> active_dispatches_ = 0;
   bool going_away_ = false;
   bool peer_sent_goaway_ = false;
   bool graceful_wait_for_peer_close_ = false;

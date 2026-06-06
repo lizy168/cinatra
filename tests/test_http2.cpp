@@ -647,12 +647,14 @@ struct server_runner {
   std::shared_ptr<asio::ip::tcp::acceptor> acceptor;
   std::shared_ptr<coro_http2_connection> active_conn;
   std::mutex active_conn_mtx;
+  std::atomic<bool> ioc_done = false;
   bool enable_connect_protocol = false;
 
   server_runner() {
     exec = std::make_unique<coro_io::ExecutorWrapper<>>(ioc.get_executor());
     ioc_thread = std::thread([this] {
       ioc.run();
+      ioc_done = true;
     });
   }
 
@@ -712,7 +714,10 @@ struct server_runner {
     if (conn_thread.joinable())
       conn_thread.join();
     work.reset();
-    ioc.stop();
+    for (int i = 0; i < 400 && !ioc_done.load(); ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    if (!ioc_done.load())
+      ioc.stop();
     if (ioc_thread.joinable())
       ioc_thread.join();
   }
@@ -735,11 +740,13 @@ struct ioc_runner {
   std::vector<std::shared_ptr<coro_http2_connection>> http2_connections;
   std::mutex mtx;
   std::atomic<bool> stopping = false;
+  std::atomic<bool> ioc_done = false;
 
   ioc_runner() {
     exec = std::make_unique<coro_io::ExecutorWrapper<>>(ioc.get_executor());
     thread = std::thread([this] {
       ioc.run();
+      ioc_done = true;
     });
   }
 
@@ -770,7 +777,10 @@ struct ioc_runner {
         worker.join();
     }
     work.reset();
-    ioc.stop();
+    for (int i = 0; i < 400 && !ioc_done.load(); ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    if (!ioc_done.load())
+      ioc.stop();
     if (thread.joinable())
       thread.join();
   }
@@ -3662,13 +3672,15 @@ TEST_CASE(
   test_http2_required_server srv(runner.ioc, 0);
   srv.init_ssl(test_tls_cert_path(), test_tls_key_path(), "test");
   std::atomic<bool> handler_started = false;
+  std::atomic<bool> handler_finished = false;
   srv.set_http_handler<cinatra::GET>(
       "/slow",
-      [&handler_started](h2_request&,
-                         h2_response& resp) -> async_simple::coro::Lazy<void> {
+      [&handler_started, &handler_finished](
+          h2_request&, h2_response& resp) -> async_simple::coro::Lazy<void> {
         handler_started = true;
         co_await coro_io::sleep_for(std::chrono::milliseconds(500));
         resp.set_status_and_body(200, "slow");
+        handler_finished = true;
         co_return;
       });
   uint16_t port = srv.start(*runner.exec);
@@ -3693,6 +3705,10 @@ TEST_CASE(
 
   REQUIRE(resp.has_value());
   CHECK(resp->net_err);
+
+  for (int i = 0; i < 100 && !handler_finished.load(); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  CHECK(handler_finished.load());
 
   client.close();
 }

@@ -33,7 +33,7 @@ jobs:
           mkdir build && cd build
           mkdir .coverage_llvm_cov
           CC=clang-17 CXX=clang++-17 cmake .. -DCOVERAGE_TEST=ON -DCINATRA_ENABLE_SSL=ON
-          make -j
+          make -j2
           export LLVM_PROFILE_FILE="test_cinatra-%m.profraw"
           cd tests
           ./test_cinatra 
