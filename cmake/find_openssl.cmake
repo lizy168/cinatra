@@ -1,3 +1,9 @@
+if(NOT CINATRA_ENABLE_SSL)
+    message(STATUS "OpenSSL support disabled")
+    set(ENABLE_SSL OFF)
+    return()
+endif()
+
 if(NOT DEFINED OPENSSL_ROOT_DIR)
     foreach(_openssl_candidate
             "C:/Program Files/OpenSSL-Win64"
