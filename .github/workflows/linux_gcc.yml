@@ -39,6 +39,31 @@ jobs:
         working-directory: ${{github.workspace}}/build
         run: ctest -C ${{matrix.mode}} -j 2 -V
 
+      - name: Report CTest Failure
+        if: failure()
+        working-directory: ${{github.workspace}}/build
+        run: |
+          if [ -f Testing/Temporary/LastTest.log ]; then
+            python3 - <<'PY'
+          from pathlib import Path
+
+          log = Path("Testing/Temporary/LastTest.log")
+          snippet = log.read_text(errors="replace")[-3500:]
+          escaped = (
+              snippet.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          )
+          print(f"::error title=CTest LastTest.log::{escaped}")
+          PY
+          fi
+
+      - name: Upload CTest Artifact
+        uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: gcc-${{ matrix.mode }}-ssl-${{ matrix.ssl }}-LastTest.log
+          if-no-files-found: ignore
+          path: ${{ github.workspace }}/build/Testing/Temporary/LastTest.log
+
   ubuntu_gcc_for_liburing:
     strategy:
       matrix:
